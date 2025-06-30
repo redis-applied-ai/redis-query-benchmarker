@@ -1,7 +1,16 @@
 """Setup configuration for Redis Query Benchmarker."""
 
 from setuptools import setup, find_packages
-import redis_benchmarker
+import re
+
+def get_version():
+    """Extract version from __init__.py without importing the package."""
+    with open("redis_benchmarker/__init__.py", "r", encoding="utf-8") as f:
+        content = f.read()
+        match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', content)
+        if match:
+            return match.group(1)
+        raise RuntimeError("Unable to find version string")
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -11,7 +20,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="redis-query-benchmarker",
-    version=redis_benchmarker.__version__,
+    version=get_version(),
     author="Redis Labs",
     author_email="support@redis.com",
     description="A production-ready benchmarking tool for Redis search queries",
