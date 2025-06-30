@@ -10,7 +10,7 @@ import redis
 import numpy as np
 from rich.console import Console
 from rich.table import Table
-from rich.progress import Progress, TaskID
+from rich.progress import Progress, TaskID, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
 
 from .config import BenchmarkConfig
 from .executors import BaseQueryExecutor, get_query_executor
@@ -181,8 +181,32 @@ class RedisBenchmarker:
 
         start_time = time.time()
 
-        with Progress() as progress:
-            task = progress.add_task("Benchmarking...", total=self.config.total_requests)
+        # Variables for efficient running average calculation
+        total_latency = 0.0
+        successful_count = 0
+
+        # Custom progress bar with real-time metrics
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("•"),
+            TextColumn("[bold blue]{task.completed}/{task.total}"),
+            TextColumn("•"),
+            TextColumn("[bold green]Avg: {task.fields[avg_latency]:.1f}ms"),
+            TextColumn("•"),
+            TextColumn("[bold cyan]QPS: {task.fields[current_qps]:.1f}"),
+            TimeRemainingColumn(),
+            console=self.console,
+            expand=True
+        ) as progress:
+            task = progress.add_task(
+                "Benchmarking...",
+                total=self.config.total_requests,
+                avg_latency=0.0,
+                current_qps=0.0
+            )
 
             with ThreadPoolExecutor(max_workers=self.config.workers) as thread_executor:
                 futures = [
@@ -199,12 +223,45 @@ class RedisBenchmarker:
                         else:
                             results.append(query_result["result"])
                             latencies.append(query_result["latency_ms"])
+                            # Update running average efficiently
+                            total_latency += query_result["latency_ms"]
+                            successful_count += 1
 
+                        # Calculate real-time metrics
+                        elapsed_time = time.time() - start_time
+
+                        # Calculate average latency using running totals
+                        if successful_count > 0:
+                            avg_latency = total_latency / successful_count
+                        else:
+                            avg_latency = 0.0
+
+                        if elapsed_time > 0:
+                            current_qps = successful_count / elapsed_time
+                        else:
+                            current_qps = 0.0
+
+                        # Update progress bar with new metrics
                         progress.advance(task)
+                        progress.update(task, avg_latency=avg_latency, current_qps=current_qps)
 
                     except Exception as e:
                         errors.append(str(e))
+                        elapsed_time = time.time() - start_time
+
+                        # Calculate metrics even on error
+                        if successful_count > 0:
+                            avg_latency = total_latency / successful_count
+                        else:
+                            avg_latency = 0.0
+
+                        if elapsed_time > 0:
+                            current_qps = successful_count / elapsed_time
+                        else:
+                            current_qps = 0.0
+
                         progress.advance(task)
+                        progress.update(task, avg_latency=avg_latency, current_qps=current_qps)
 
         end_time = time.time()
         total_time = end_time - start_time
