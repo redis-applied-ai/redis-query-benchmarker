@@ -48,11 +48,10 @@ def make_query():
             filter_expression="(@__schema__:{ProductSchema} @__schema_field__ProductSchema_inventory__is_active:{1})",
         )
 
-        with time_operation() as get_latency_ms:
+        with time_operation() as latency_ms:
             res = index.query(vquery)
-        latency = get_latency_ms()
 
-        return {"result": res, "latency_ms": latency}
+        return {"result": res, "latency_ms": float(latency_ms)}
     finally:
         # Explicitly release the connection back to the pool
         r.close()
@@ -128,3 +127,12 @@ def stress_test():
 
 results, latencies = stress_test()
 print(f"\nFirst result sample: {results[0][:3]}...")  # Show first 3 results
+
+# Test basic timing functionality
+print("Testing time_operation utility...")
+
+with time_operation() as latency_ms:
+    time.sleep(0.1)  # Simulate 100ms operation
+
+print(f"Measured latency: {latency_ms} ms (should be ~100ms)")
+assert 90 <= latency_ms <= 150, f"Expected ~100ms, got {latency_ms}ms"

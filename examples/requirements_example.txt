@@ -1,0 +1,24 @@
+# Example requirements.txt for a standalone package using redis-query-benchmarker
+#
+# This shows how you would depend on redis-query-benchmarker in your own project
+
+# Method 1: PyPI dependency (when redis-query-benchmarker is published to PyPI)
+# redis-query-benchmarker>=0.1.0
+
+# Method 2: GitHub dependency (current approach)
+# Install directly from GitHub repository
+git+https://github.com/redis-applied-ai/redis-query-benchmarker.git
+
+# Method 3: Local development dependency (for testing)
+# -e /path/to/local/redis-query-benchmarker
+
+# Other dependencies your custom executor might need
+redis>=5.0.0
+redisvl>=0.7.0
+numpy>=1.24.0
+
+# Optional: Additional dependencies for your specific use case
+# pandas>=2.0.0           # For data analysis
+# matplotlib>=3.7.0       # For plotting results
+# requests>=2.31.0        # For API calls
+# boto3>=1.28.0           # For AWS services

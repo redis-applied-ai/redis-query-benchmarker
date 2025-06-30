@@ -17,7 +17,7 @@ setup(
     description="A production-ready benchmarking tool for Redis search queries",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/redis/redis-query-benchmarker",
+    url="https://github.com/redis-applied-ai/redis-query-benchmarker",
     packages=find_packages(exclude=["tests*", "examples*"]),
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -55,8 +55,8 @@ setup(
     include_package_data=True,
     keywords="redis search benchmark vector database performance testing",
     project_urls={
-        "Bug Reports": "https://github.com/redis/redis-query-benchmarker/issues",
-        "Source": "https://github.com/redis/redis-query-benchmarker",
-        "Documentation": "https://github.com/redis/redis-query-benchmarker#readme",
+        "Bug Reports": "https://github.com/redis-applied-ai/redis-query-benchmarker/issues",
+        "Source": "https://github.com/redis-applied-ai/redis-query-benchmarker",
+        "Documentation": "https://github.com/redis-applied-ai/redis-query-benchmarker#readme",
     },
 )

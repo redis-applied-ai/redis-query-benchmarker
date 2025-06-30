@@ -12,25 +12,24 @@ class TestTimingUtilities:
         """Test the time_operation context manager."""
         sleep_duration = 0.1
 
-        with time_operation() as get_latency_ms:
+        with time_operation() as latency_ms:
             time.sleep(sleep_duration)
-
-        latency_ms = get_latency_ms()
 
         # Should be approximately 100ms (with some tolerance for system variance)
         assert 90 <= latency_ms <= 150, f"Expected ~100ms, got {latency_ms}ms"
 
     def test_time_operation_multiple_calls(self):
-        """Test that get_latency_ms can be called multiple times."""
-        with time_operation() as get_latency_ms:
-            time.sleep(0.05)
-            first_call = get_latency_ms()
-            time.sleep(0.05)
-            second_call = get_latency_ms()
+        """Test that LatencyTimer behaves like a number and can be used multiple times."""
+        with time_operation() as latency_ms:
+            time.sleep(0.1)
 
-        # Second call should be greater than first call
-        assert second_call > first_call
-        assert 90 <= second_call <= 150  # Should be around 100ms total
+        # Test that we can use the timer value multiple times
+        first_access = float(latency_ms)
+        second_access = float(latency_ms)
+
+        # Both accesses should return the same value
+        assert first_access == second_access
+        assert 90 <= first_access <= 150  # Should be around 100ms
 
     def test_time_function_wrapper(self):
         """Test the time_function wrapper."""
@@ -70,11 +69,33 @@ class TestTimingUtilities:
         tolerance = 0.02  # 20ms tolerance
 
         for duration in test_durations:
-            with time_operation() as get_latency_ms:
+            with time_operation() as latency_ms:
                 time.sleep(duration)
 
-            latency_ms = get_latency_ms()
             expected_ms = duration * 1000
 
             assert abs(latency_ms - expected_ms) <= (tolerance * 1000), \
                 f"Duration {duration}s: expected ~{expected_ms}ms, got {latency_ms}ms"
+
+    def test_latency_timer_numeric_behavior(self):
+        """Test that LatencyTimer behaves like a number."""
+        with time_operation() as latency_ms:
+            time.sleep(0.05)
+
+        # Test conversion to float
+        assert isinstance(float(latency_ms), float)
+
+        # Test conversion to int
+        assert isinstance(int(latency_ms), int)
+
+        # Test arithmetic operations
+        doubled = latency_ms * 2
+        assert doubled == float(latency_ms) * 2
+
+        # Test comparison operations
+        assert latency_ms > 0
+        assert latency_ms >= 0
+        assert latency_ms == latency_ms
+
+        # Test string representation
+        assert str(latency_ms) == str(float(latency_ms))

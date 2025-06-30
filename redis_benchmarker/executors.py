@@ -1,22 +1,115 @@
 """Query executor implementations for different Redis search patterns."""
 
-from abc import ABC, abstractmethod
+from abc import ABC, abstractmethod, ABCMeta
 from typing import Dict, Any, List, Optional, Type
 import time
 import random
 import redis
 import numpy as np
+import sys
+import inspect
+import atexit
 from redisvl.index import SearchIndex
 from redisvl.query import VectorQuery, FilterQuery
+from redis.commands.search.query import Query
 
 from .utils import time_operation
 
 # Global registry for query executors
 _QUERY_EXECUTORS: Dict[str, Type["BaseQueryExecutor"]] = {}
 
+# Track executors that were defined in __main__ modules
+_MAIN_MODULE_EXECUTORS: List[tuple[str, Type["BaseQueryExecutor"]]] = []
+_CLI_INVOKED = False
 
-class BaseQueryExecutor(ABC):
-    """Base class for query executors."""
+
+class AutoMainMeta(ABCMeta):
+    """
+    Metaclass that automatically handles executor registration and CLI functionality.
+    Inherits from ABCMeta to work with ABC.
+
+    When a BaseQueryExecutor subclass is defined:
+    1. Automatically registers it with a smart name
+    2. If defined in a __main__ module, schedules CLI execution
+    """
+
+    def __new__(mcs, name, bases, namespace, **kwargs):
+        # Create the class normally
+        cls = super().__new__(mcs, name, bases, namespace, **kwargs)
+
+        # Only process actual BaseQueryExecutor subclasses (not BaseQueryExecutor itself)
+        # Check if this is not the base class and has bases (i.e., it's inheriting from something)
+        if (not getattr(cls, '_is_base_class', False) and
+            bases and
+            name != 'BaseQueryExecutor'):
+
+            # Get the module where this class was defined
+            module_name = cls.__module__
+
+            # Auto-register the executor
+            executor_name = cls.get_executor_name()
+            register_query_executor(executor_name, cls)
+
+            # If this class was defined in a __main__ module, schedule CLI execution
+            if module_name == '__main__':
+                _MAIN_MODULE_EXECUTORS.append((executor_name, cls))
+                # Set up atexit handler to run CLI when the script ends
+                if not _CLI_INVOKED:
+                    atexit.register(_auto_invoke_cli)
+
+        return cls
+
+
+def _auto_invoke_cli():
+    """
+    Automatically invoke CLI if executors were defined in __main__ module.
+    Called via atexit when the module execution is complete.
+    """
+    global _CLI_INVOKED
+
+    # Only invoke once
+    if _CLI_INVOKED or not _MAIN_MODULE_EXECUTORS:
+        return
+
+    _CLI_INVOKED = True
+
+    # Determine which executor to use as default
+    executor_names = [name for name, _ in _MAIN_MODULE_EXECUTORS]
+
+    if len(executor_names) == 1:
+        # Single executor - auto-add as default if not specified
+        default_name = executor_names[0]
+        if "--query-type" not in sys.argv:
+            sys.argv.extend(["--query-type", default_name])
+    else:
+        # Multiple executors - require user to specify
+        if "--query-type" not in sys.argv:
+            print(f"Multiple executors found: {', '.join(executor_names)}")
+            print("Please specify which one to use with --query-type")
+            sys.exit(1)
+
+    # Import and run the CLI
+    try:
+        # Try relative import first (when running from package)
+        try:
+            from .__main__ import main as cli_main
+        except ImportError:
+            # Fall back to absolute import (when running as script)
+            from redis_benchmarker.__main__ import main as cli_main
+        cli_main()
+    except SystemExit:
+        # Click uses SystemExit for --help and error conditions
+        raise
+    except ImportError as e:
+        print(f"Error: Could not import CLI module: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+class BaseQueryExecutor(ABC, metaclass=AutoMainMeta):
+    """Base class for query executors with automatic registration and CLI functionality."""
+
+    # Mark this as the base class to avoid self-registration
+    _is_base_class = True
 
     def __init__(self, config: "BenchmarkConfig"):
         self.config = config
@@ -44,6 +137,31 @@ class BaseQueryExecutor(ABC):
     def cleanup(self, redis_client: redis.Redis) -> None:
         """Optional cleanup step after benchmarking ends."""
         pass
+
+    @classmethod
+    def get_executor_name(cls) -> str:
+        """
+        Get the executor name for registration.
+
+        Override the 'executor_name' class attribute to specify a custom name,
+        otherwise uses the class name converted to snake_case.
+        """
+        if hasattr(cls, 'executor_name') and cls.executor_name:
+            return cls.executor_name
+
+        # Convert class name to snake_case
+        name = cls.__name__
+        if name.endswith('Executor'):
+            name = name[:-8]  # Remove 'Executor' suffix
+
+        # Convert CamelCase to snake_case
+        result = []
+        for i, char in enumerate(name):
+            if char.isupper() and i > 0:
+                result.append('_')
+            result.append(char.lower())
+
+        return ''.join(result)
 
 
 class VectorSearchExecutor(BaseQueryExecutor):
@@ -82,13 +200,12 @@ class VectorSearchExecutor(BaseQueryExecutor):
             **self.config.extra_params
         )
 
-        with time_operation() as get_latency_ms:
+        with time_operation() as latency_ms:
             result = self.index.query(query)
-        latency_ms = get_latency_ms()
 
         return {
             "result": result,
-            "latency_ms": latency_ms,
+            "latency_ms": float(latency_ms),
             "metadata": {"vector_dim": self.config.vector_dim, "num_results": len(result)}
         }
 
@@ -130,13 +247,12 @@ class HybridSearchExecutor(BaseQueryExecutor):
             **{k: v for k, v in self.config.extra_params.items() if k != "filter_expression"}
         )
 
-        with time_operation() as get_latency_ms:
+        with time_operation() as latency_ms:
             result = self.index.query(query)
-        latency_ms = get_latency_ms()
 
         return {
             "result": result,
-            "latency_ms": latency_ms,
+            "latency_ms": float(latency_ms),
             "metadata": {
                 "vector_dim": self.config.vector_dim,
                 "num_results": len(result),
@@ -155,16 +271,15 @@ class RedisPySearchExecutor(BaseQueryExecutor):
     def execute_query(self, redis_client: redis.Redis) -> Dict[str, Any]:
         index_name = self.config.index_name or "idx"
 
-        with time_operation() as get_latency_ms:
+        with time_operation() as latency_ms:
             result = redis_client.ft(index_name).search(
                 self.search_query,
                 query_params={"LIMIT": [0, self.config.num_results]}
             )
-        latency_ms = get_latency_ms()
 
         return {
             "result": result,
-            "latency_ms": latency_ms,
+            "latency_ms": float(latency_ms),
             "metadata": {
                 "total_results": result.total,
                 "returned_results": len(result.docs),
@@ -187,6 +302,94 @@ def get_query_executor(name: str) -> Optional[Type[BaseQueryExecutor]]:
 def list_query_executors() -> List[str]:
     """List all registered query executor names."""
     return list(_QUERY_EXECUTORS.keys())
+
+
+def _discover_executors_in_module(module_name: str) -> List[Type[BaseQueryExecutor]]:
+    """
+    Discover all BaseQueryExecutor subclasses in the given module.
+
+    Args:
+        module_name: The name of the module to inspect (usually __name__)
+
+    Returns:
+        List of discovered executor classes
+    """
+    if module_name not in sys.modules:
+        return []
+
+    module = sys.modules[module_name]
+    executors = []
+
+    for name, obj in inspect.getmembers(module, inspect.isclass):
+        if (obj != BaseQueryExecutor and
+            issubclass(obj, BaseQueryExecutor) and
+            obj.__module__ == module_name):
+            executors.append(obj)
+
+    return executors
+
+
+def enable_auto_main(module_name: str, default_executor_name: Optional[str] = None) -> None:
+    """
+    Enable automatic CLI functionality for custom executors.
+
+    NOTE: This function is now DEPRECATED. Simply inheriting from BaseQueryExecutor
+    automatically provides CLI functionality. This function is kept for backward compatibility.
+
+    Args:
+        module_name: The module name (pass __name__)
+        default_executor_name: Optional specific executor name to use as default
+    """
+    # Only activate if this module is being run as main
+    if module_name != '__main__':
+        return
+
+    # Discover and register executors in the module
+    executors = _discover_executors_in_module(module_name)
+
+    if not executors:
+        print("Error: No BaseQueryExecutor subclasses found in this module", file=sys.stderr)
+        sys.exit(1)
+
+    # Register all discovered executors
+    registered_names = []
+    for executor_class in executors:
+        executor_name = executor_class.get_executor_name()
+        register_query_executor(executor_name, executor_class)
+        registered_names.append(executor_name)
+
+    # Determine which executor to use as default
+    if default_executor_name and default_executor_name in registered_names:
+        default_name = default_executor_name
+    elif len(registered_names) == 1:
+        default_name = registered_names[0]
+    else:
+        # Multiple executors found, let user choose or specify
+        if "--query-type" not in sys.argv:
+            print(f"Multiple executors found: {', '.join(registered_names)}")
+            print("Please specify which one to use with --query-type")
+            sys.exit(1)
+        default_name = None
+
+    # Add default query type if not specified
+    if default_name and "--query-type" not in sys.argv:
+        sys.argv.extend(["--query-type", default_name])
+
+    # Import and run the CLI
+    try:
+        # Try relative import first (when running from package)
+        try:
+            from .__main__ import main as cli_main
+        except ImportError:
+            # Fall back to absolute import (when running as script)
+            from redis_benchmarker.__main__ import main as cli_main
+        cli_main()
+    except SystemExit:
+        # Click uses SystemExit for --help and error conditions
+        raise
+    except ImportError as e:
+        print(f"Error: Could not import CLI module: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 # Register built-in executors

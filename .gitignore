@@ -92,3 +92,7 @@ test_config.json
 .dockerignore
 
 examples/superlink_executor.py
+examples/character_executor.py
+
+examples/REFACTORING_SUMMARY.md
+scripts/migrate_from_old_script.py
