@@ -134,3 +134,23 @@ class TestBenchmarkConfig:
 
         finally:
             os.unlink(temp_file)
+
+    def test_qps_field(self):
+        """Test qps field in BenchmarkConfig."""
+        config = BenchmarkConfig(qps=123.45)
+        assert config.qps == 123.45
+        config_dict = config.to_dict()
+        assert 'qps' in config_dict
+        assert config_dict['qps'] == 123.45
+        # Test default is None
+        config2 = BenchmarkConfig()
+        assert config2.qps is None
+        # Test serialization/deserialization
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            temp_file = f.name
+        try:
+            config.save_to_file(temp_file)
+            loaded = BenchmarkConfig.from_file(temp_file)
+            assert loaded.qps == 123.45
+        finally:
+            os.unlink(temp_file)
