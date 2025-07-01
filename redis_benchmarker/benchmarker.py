@@ -209,10 +209,17 @@ class RedisBenchmarker:
             )
 
             with ThreadPoolExecutor(max_workers=self.config.workers) as thread_executor:
-                futures = [
-                    thread_executor.submit(self._execute_single_query, executor)
-                    for _ in range(self.config.total_requests)
-                ]
+                futures = []
+                qps = self.config.qps
+                next_submit_time = time.time()
+                for i in range(self.config.total_requests):
+                    now = time.time()
+                    if qps:
+                        # Wait until the next allowed submission time
+                        if now < next_submit_time:
+                            time.sleep(next_submit_time - now)
+                        next_submit_time = max(next_submit_time + 1.0 / qps, time.time())
+                    futures.append(thread_executor.submit(self._execute_single_query, executor))
 
                 for future in as_completed(futures):
                     try:

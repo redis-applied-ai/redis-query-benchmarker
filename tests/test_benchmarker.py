@@ -5,6 +5,7 @@ from unittest.mock import Mock, MagicMock, patch
 import tempfile
 import json
 import csv
+import time
 
 from redis_benchmarker.config import BenchmarkConfig
 from redis_benchmarker.benchmarker import RedisBenchmarker, BenchmarkResults
@@ -309,3 +310,37 @@ class TestRedisBenchmarker:
 
         with pytest.raises(ConnectionError, match="Cannot connect to Redis"):
             benchmarker.run_benchmark()
+
+    @patch('redis_benchmarker.benchmarker.get_query_executor')
+    @patch('redis.Redis')
+    @patch('redis.ConnectionPool')
+    def test_run_benchmark_qps_throttling(self, mock_pool, mock_redis, mock_get_executor):
+        """Test QPS throttling in benchmark run."""
+        config = BenchmarkConfig(
+            total_requests=5,
+            workers=2,
+            query_type="mock_executor",
+            qps=2.0  # 2 queries per second
+        )
+        mock_executor_class = Mock(return_value=MockExecutor(config, latency=10.0))
+        mock_get_executor.return_value = mock_executor_class
+        mock_redis_client = Mock()
+        mock_redis_client.ping.return_value = True
+        mock_redis_client.close.return_value = None
+        mock_redis.return_value = mock_redis_client
+
+        benchmarker = RedisBenchmarker(config)
+        # Patch time.time and time.sleep to simulate time passing
+        times = [100.0]
+        def fake_time():
+            return times[0]
+        def fake_sleep(secs):
+            times[0] += secs
+        with patch('time.time', fake_time), patch('time.sleep', fake_sleep):
+            start = fake_time()
+            results = benchmarker.run_benchmark()
+            end = fake_time()
+        # For 5 requests at 2 QPS, minimum time should be at least 2 seconds
+        assert end - start >= 2.0
+        assert results.total_requests == 5
+        assert results.successful_requests == 5

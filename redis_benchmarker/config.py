@@ -43,6 +43,7 @@ class BenchmarkConfig(BaseModel):
     # Advanced settings
     warmup_requests: int = Field(default=0, description="Number of warmup requests", ge=0)
     timeout: float = Field(default=30.0, description="Query timeout in seconds")
+    qps: Optional[float] = Field(default=None, description="Target queries per second (QPS)")
     extra_params: Dict[str, Any] = Field(default_factory=dict, description="Extra parameters")
 
     @field_validator('workers')

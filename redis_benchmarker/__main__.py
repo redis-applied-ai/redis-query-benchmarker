@@ -36,6 +36,7 @@ from .executors import list_query_executors
 @click.option('--filter-expression', default=None, help='Filter expression for hybrid search')
 @click.option('--search-query', default='*', help='Search query for redis-py search')
 @click.option('--max-connections', default=None, type=int, help='Max connections in pool')
+@click.option('--qps', default=None, type=float, help='Target queries per second (QPS)')
 def main(**kwargs):
     """Redis Query Benchmarker - Benchmark Redis search queries with configurable executors."""
 
@@ -77,6 +78,7 @@ def main(**kwargs):
                 warmup_requests=kwargs['warmup_requests'],
                 timeout=kwargs['timeout'],
                 verbose=kwargs['verbose'],
+                qps=kwargs['qps'],
                 extra_params=extra_params
             )
 
