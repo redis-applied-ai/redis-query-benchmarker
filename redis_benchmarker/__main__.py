@@ -100,6 +100,7 @@ def main(**kwargs):
         click.echo(f"Query Type: {config.query_type}")
         click.echo(f"Requests: {config.total_requests}")
         click.echo(f"Workers: {config.workers}")
+        click.echo(f"QPS: {config.qps}")
         if config.index_name:
             click.echo(f"Index: {config.index_name}")
         click.echo()
