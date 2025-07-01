@@ -3,6 +3,8 @@
 import time
 import json
 import csv
+import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
@@ -209,66 +211,110 @@ class RedisBenchmarker:
             )
 
             with ThreadPoolExecutor(max_workers=self.config.workers) as thread_executor:
-                futures = []
-                qps = self.config.qps
-                next_submit_time = time.time()
-                for i in range(self.config.total_requests):
-                    now = time.time()
-                    if qps:
-                        # Wait until the next allowed submission time
-                        if now < next_submit_time:
-                            time.sleep(next_submit_time - now)
-                        next_submit_time = max(next_submit_time + 1.0 / qps, time.time())
-                    futures.append(thread_executor.submit(self._execute_single_query, executor))
+                futures_queue = deque()
+                submission_complete = threading.Event()
 
-                for future in as_completed(futures):
-                    try:
-                        query_result = future.result(timeout=self.config.timeout)
+                def submit_futures():
+                    """Submit futures with QPS limiting in a separate thread."""
+                    qps = self.config.qps
+                    next_submit_time = time.time()
+                    for i in range(self.config.total_requests):
+                        now = time.time()
+                        if qps:
+                            # Wait until the next allowed submission time
+                            if now < next_submit_time:
+                                time.sleep(next_submit_time - now)
+                            next_submit_time = max(next_submit_time + 1.0 / qps, time.time())
 
-                        if "error" in query_result:
-                            errors.append(query_result["error"])
-                        else:
-                            results.append(query_result["result"])
-                            latencies.append(query_result["latency_ms"])
-                            # Update running average efficiently
-                            total_latency += query_result["latency_ms"]
-                            successful_count += 1
+                        future = thread_executor.submit(self._execute_single_query, executor)
+                        futures_queue.append(future)
 
-                        # Calculate real-time metrics
-                        elapsed_time = time.time() - start_time
+                    submission_complete.set()
 
-                        # Calculate average latency using running totals
-                        if successful_count > 0:
-                            avg_latency = total_latency / successful_count
-                        else:
-                            avg_latency = 0.0
+                # Start submission thread
+                submission_thread = threading.Thread(target=submit_futures)
+                submission_thread.start()
 
-                        if elapsed_time > 0:
-                            current_qps = successful_count / elapsed_time
-                        else:
-                            current_qps = 0.0
+                # Process completions as they become available
+                completed_count = 0
+                processed_futures = set()
 
-                        # Update progress bar with new metrics
-                        progress.advance(task)
-                        progress.update(task, avg_latency=avg_latency, current_qps=current_qps)
+                while completed_count < self.config.total_requests:
+                    # Collect available futures
+                    available_futures = []
+                    while futures_queue:
+                        try:
+                            future = futures_queue.popleft()
+                            if future not in processed_futures:
+                                available_futures.append(future)
+                        except IndexError:
+                            break
 
-                    except Exception as e:
-                        errors.append(str(e))
-                        elapsed_time = time.time() - start_time
+                    # Process any completed futures
+                    if available_futures:
+                        # Check which futures are done (non-blocking)
+                        for future in available_futures:
+                            if future.done() and future not in processed_futures:
+                                processed_futures.add(future)
+                                try:
+                                    query_result = future.result(timeout=self.config.timeout)
 
-                        # Calculate metrics even on error
-                        if successful_count > 0:
-                            avg_latency = total_latency / successful_count
-                        else:
-                            avg_latency = 0.0
+                                    if "error" in query_result:
+                                        errors.append(query_result["error"])
+                                    else:
+                                        results.append(query_result["result"])
+                                        latencies.append(query_result["latency_ms"])
+                                        # Update running average efficiently
+                                        total_latency += query_result["latency_ms"]
+                                        successful_count += 1
 
-                        if elapsed_time > 0:
-                            current_qps = successful_count / elapsed_time
-                        else:
-                            current_qps = 0.0
+                                    # Calculate real-time metrics
+                                    elapsed_time = time.time() - start_time
 
-                        progress.advance(task)
-                        progress.update(task, avg_latency=avg_latency, current_qps=current_qps)
+                                    # Calculate average latency using running totals
+                                    if successful_count > 0:
+                                        avg_latency = total_latency / successful_count
+                                    else:
+                                        avg_latency = 0.0
+
+                                    if elapsed_time > 0:
+                                        current_qps = successful_count / elapsed_time
+                                    else:
+                                        current_qps = 0.0
+
+                                    # Update progress bar with new metrics
+                                    progress.advance(task)
+                                    progress.update(task, avg_latency=avg_latency, current_qps=current_qps)
+                                    completed_count += 1
+
+                                except Exception as e:
+                                    errors.append(str(e))
+                                    elapsed_time = time.time() - start_time
+
+                                    # Calculate metrics even on error
+                                    if successful_count > 0:
+                                        avg_latency = total_latency / successful_count
+                                    else:
+                                        avg_latency = 0.0
+
+                                    if elapsed_time > 0:
+                                        current_qps = successful_count / elapsed_time
+                                    else:
+                                        current_qps = 0.0
+
+                                    progress.advance(task)
+                                    progress.update(task, avg_latency=avg_latency, current_qps=current_qps)
+                                    completed_count += 1
+                            else:
+                                # Put back unfinished futures for next iteration
+                                futures_queue.appendleft(future)
+
+                    # Small sleep to avoid busy waiting, but only if no futures completed this iteration
+                    if not any(f.done() for f in available_futures):
+                        time.sleep(0.01)
+
+                # Wait for submission thread to complete
+                submission_thread.join()
 
         end_time = time.time()
         total_time = end_time - start_time
