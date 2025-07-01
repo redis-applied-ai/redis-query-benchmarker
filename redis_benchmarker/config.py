@@ -39,6 +39,7 @@ class BenchmarkConfig(BaseModel):
     output_format: str = Field(default="console", description="Output format")
     output_file: Optional[str] = Field(default=None, description="Output file path")
     verbose: bool = Field(default=False, description="Verbose output")
+    show_expanded_metrics: bool = Field(default=False, description="Show expanded metrics including result counts and normalized latency")
 
     # Advanced settings
     warmup_requests: int = Field(default=0, description="Number of warmup requests", ge=0)

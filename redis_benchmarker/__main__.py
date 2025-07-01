@@ -31,6 +31,7 @@ from .executors import list_query_executors
 @click.option('--warmup-requests', default=0, help='Number of warmup requests')
 @click.option('--timeout', default=30.0, help='Query timeout in seconds')
 @click.option('--verbose', is_flag=True, help='Verbose output')
+@click.option('--show-expanded-metrics', is_flag=True, help='Show expanded metrics including result counts and normalized latency')
 @click.option('--config-file', default=None, help='Load configuration from JSON file')
 @click.option('--save-config', default=None, help='Save configuration to JSON file')
 @click.option('--filter-expression', default=None, help='Filter expression for hybrid search')
@@ -78,6 +79,7 @@ def main(**kwargs):
                 warmup_requests=kwargs['warmup_requests'],
                 timeout=kwargs['timeout'],
                 verbose=kwargs['verbose'],
+                show_expanded_metrics=kwargs['show_expanded_metrics'],
                 qps=kwargs['qps'],
                 extra_params=extra_params
             )

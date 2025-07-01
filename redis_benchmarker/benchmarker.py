@@ -30,6 +30,7 @@ class BenchmarkResults:
     errors: List[str]
     metadata: Dict[str, Any]
     config: BenchmarkConfig
+    result_counts: List[int]
 
     @property
     def qps(self) -> float:
@@ -40,6 +41,24 @@ class BenchmarkResults:
     def success_rate(self) -> float:
         """Calculate success rate percentage."""
         return (self.successful_requests / self.total_requests) * 100 if self.total_requests > 0 else 0.0
+
+    @property
+    def average_result_count(self) -> float:
+        """Calculate average number of results per query."""
+        return np.mean(self.result_counts) if self.result_counts else 0.0
+
+    @property
+    def average_normalized_latency(self) -> float:
+        """Calculate average normalized latency (latency per result)."""
+        if not self.latencies or not self.result_counts or len(self.latencies) != len(self.result_counts):
+            return 0.0
+
+        normalized_latencies = []
+        for latency, count in zip(self.latencies, self.result_counts):
+            if count > 0:
+                normalized_latencies.append(latency / count)
+
+        return np.mean(normalized_latencies) if normalized_latencies else 0.0
 
     def get_latency_stats(self) -> Dict[str, float]:
         """Calculate latency statistics."""
@@ -128,6 +147,29 @@ class RedisBenchmarker:
         finally:
             redis_client.close()
 
+    def _extract_result_count(self, query_result: Dict[str, Any]) -> int:
+        """Extract result count from query result metadata."""
+        metadata = query_result.get("metadata", {})
+
+        # Check for different result count fields based on executor type
+        if "num_results" in metadata:
+            return metadata["num_results"]
+        elif "returned_results" in metadata:
+            return metadata["returned_results"]
+
+        # Fallback: try to get length from result directly
+        result = query_result.get("result")
+        if result is not None:
+            try:
+                if hasattr(result, '__len__'):
+                    return len(result)
+                elif hasattr(result, 'docs') and hasattr(result.docs, '__len__'):
+                    return len(result.docs)
+            except (TypeError, AttributeError):
+                pass
+
+        return 0
+
     def _run_warmup(self, executor: BaseQueryExecutor) -> None:
         """Run warmup queries to prepare connections and caches."""
         if self.config.warmup_requests <= 0:
@@ -180,15 +222,17 @@ class RedisBenchmarker:
         results = []
         latencies = []
         errors = []
+        result_counts = []
 
         start_time = time.time()
 
         # Variables for efficient running average calculation
         total_latency = 0.0
+        total_result_count = 0
         successful_count = 0
 
         # Custom progress bar with real-time metrics
-        with Progress(
+        progress_columns = [
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -199,15 +243,38 @@ class RedisBenchmarker:
             TextColumn("[bold green]Avg: {task.fields[avg_latency]:.1f}ms"),
             TextColumn("•"),
             TextColumn("[bold cyan]QPS: {task.fields[current_qps]:.1f}"),
-            TimeRemainingColumn(),
+        ]
+
+        if self.config.show_expanded_metrics:
+            progress_columns.extend([
+                TextColumn("•"),
+                TextColumn("[bold yellow]Avg Results: {task.fields[avg_results]:.1f}"),
+                TextColumn("•"),
+                TextColumn("[bold magenta]Norm Lat: {task.fields[norm_latency]:.2f}ms/result"),
+            ])
+
+        progress_columns.append(TimeRemainingColumn())
+
+        with Progress(
+            *progress_columns,
             console=self.console,
             expand=True
         ) as progress:
+            task_fields = {
+                "avg_latency": 0.0,
+                "current_qps": 0.0
+            }
+
+            if self.config.show_expanded_metrics:
+                task_fields.update({
+                    "avg_results": 0.0,
+                    "norm_latency": 0.0
+                })
+
             task = progress.add_task(
                 "Benchmarking...",
                 total=self.config.total_requests,
-                avg_latency=0.0,
-                current_qps=0.0
+                **task_fields
             )
 
             with ThreadPoolExecutor(max_workers=self.config.workers) as thread_executor:
@@ -264,8 +331,14 @@ class RedisBenchmarker:
                                     else:
                                         results.append(query_result["result"])
                                         latencies.append(query_result["latency_ms"])
-                                        # Update running average efficiently
+
+                                        # Extract result count from metadata
+                                        result_count = self._extract_result_count(query_result)
+                                        result_counts.append(result_count)
+
+                                        # Update running averages efficiently
                                         total_latency += query_result["latency_ms"]
+                                        total_result_count += result_count
                                         successful_count += 1
 
                                     # Calculate real-time metrics
@@ -274,17 +347,30 @@ class RedisBenchmarker:
                                     # Calculate average latency using running totals
                                     if successful_count > 0:
                                         avg_latency = total_latency / successful_count
+                                        avg_results = total_result_count / successful_count
                                     else:
                                         avg_latency = 0.0
+                                        avg_results = 0.0
 
                                     if elapsed_time > 0:
                                         current_qps = successful_count / elapsed_time
                                     else:
                                         current_qps = 0.0
 
+                                    # Calculate normalized latency
+                                    norm_latency = avg_latency / avg_results if avg_results > 0 else 0.0
+
                                     # Update progress bar with new metrics
                                     progress.advance(task)
-                                    progress.update(task, avg_latency=avg_latency, current_qps=current_qps)
+                                    update_fields = {"avg_latency": avg_latency, "current_qps": current_qps}
+
+                                    if self.config.show_expanded_metrics:
+                                        update_fields.update({
+                                            "avg_results": avg_results,
+                                            "norm_latency": norm_latency
+                                        })
+
+                                    progress.update(task, **update_fields)
                                     completed_count += 1
 
                                 except Exception as e:
@@ -294,16 +380,29 @@ class RedisBenchmarker:
                                     # Calculate metrics even on error
                                     if successful_count > 0:
                                         avg_latency = total_latency / successful_count
+                                        avg_results = total_result_count / successful_count
                                     else:
                                         avg_latency = 0.0
+                                        avg_results = 0.0
 
                                     if elapsed_time > 0:
                                         current_qps = successful_count / elapsed_time
                                     else:
                                         current_qps = 0.0
 
+                                    # Calculate normalized latency
+                                    norm_latency = avg_latency / avg_results if avg_results > 0 else 0.0
+
                                     progress.advance(task)
-                                    progress.update(task, avg_latency=avg_latency, current_qps=current_qps)
+                                    update_fields = {"avg_latency": avg_latency, "current_qps": current_qps}
+
+                                    if self.config.show_expanded_metrics:
+                                        update_fields.update({
+                                            "avg_results": avg_results,
+                                            "norm_latency": norm_latency
+                                        })
+
+                                    progress.update(task, **update_fields)
                                     completed_count += 1
                             else:
                                 # Put back unfinished futures for next iteration
@@ -338,7 +437,8 @@ class RedisBenchmarker:
                 "workers": self.config.workers,
                 "redis_host": f"{self.config.redis.host}:{self.config.redis.port}",
             },
-            config=self.config
+            config=self.config,
+            result_counts=result_counts
         )
 
     def format_results(self, results: BenchmarkResults) -> str:
@@ -361,6 +461,10 @@ class RedisBenchmarker:
         output.append(f"  Sent {results.successful_requests} queries in {results.total_time:.2f} seconds")
         output.append(f"  Average QPS: {results.qps:.2f}")
         output.append(f"  Success Rate: {results.success_rate:.1f}%")
+
+        if results.result_counts:
+            output.append(f"  Average Results per Query: {results.average_result_count:.2f}")
+            output.append(f"  Average Normalized Latency: {results.average_normalized_latency:.2f}ms/result")
 
         if results.failed_requests > 0:
             output.append(f"  Failed Requests: {results.failed_requests}")
@@ -409,6 +513,8 @@ class RedisBenchmarker:
                     "total_time": results.total_time,
                     "qps": results.qps,
                     "success_rate": results.success_rate,
+                    "average_result_count": results.average_result_count,
+                    "average_normalized_latency": results.average_normalized_latency,
                 },
                 "latency_stats": results.get_latency_stats(),
                 "latency_distribution": [
@@ -416,6 +522,7 @@ class RedisBenchmarker:
                     for label, count, percentage in results.get_latency_distribution()
                 ],
                 "raw_latencies": results.latencies,
+                "raw_result_counts": results.result_counts,
                 "errors": results.errors,
                 "metadata": results.metadata,
             }
