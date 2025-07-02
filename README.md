@@ -25,14 +25,15 @@ import redis
 from redis_benchmarker.executors import BaseQueryExecutor, enable_auto_main
 from redis_benchmarker.utils import time_operation
 import numpy as np
-from redis_benchmarker.query import Query
+from redis.commands.search.query import Query
 
 class MySearchExecutor(BaseQueryExecutor):
     def execute_query(self, redis_client: redis.Redis) -> dict:
         """Your custom search logic goes here."""
 
-        # Generate random query vector
-        query_vector = np.random.rand(512).astype(np.float32)
+        # Get pre-generated vector from pool for better performance
+        # This avoids expensive vector generation during timing
+        query_vector = self.get_vector_from_pool()
 
         # Time the search operation
         with time_operation() as latency_ms:
@@ -85,6 +86,57 @@ python -m redis_benchmarker.data_generator \
   --index-name my_index \
   --create-index
 ```
+
+## Vector Pool for Performance
+
+The benchmarker includes a **vector pool feature** that pre-generates vectors before benchmarking starts. This eliminates the overhead of vector generation during query execution, providing more accurate performance measurements.
+
+### Using the Vector Pool
+
+The vector pool is enabled by default. Simply use `self.get_vector_from_pool()` in your `execute_query` method:
+
+```python
+class MyVectorExecutor(BaseQueryExecutor):
+    def execute_query(self, redis_client: redis.Redis) -> dict:
+        # Get pre-generated vector (much faster than generating during query)
+        query_vector = self.get_vector_from_pool()
+
+        with time_operation() as latency_ms:
+            result = redis_client.ft("my_index").search(
+                Query("*=>[KNN 10 @embedding $query_vector AS score]"),
+                query_params={"query_vector": query_vector.tobytes()}
+            )
+
+        return {"result": result, "latency_ms": float(latency_ms)}
+```
+
+### Customizing Vector Generation
+
+Override `make_single_vector()` to customize how vectors are generated for your use case:
+
+```python
+class CustomVectorExecutor(BaseQueryExecutor):
+    def make_single_vector(self) -> np.ndarray:
+        """Generate custom vectors (e.g., normal distribution, specific patterns)."""
+        # Use normal distribution instead of uniform random
+        return np.random.randn(self.config.vector_dim).astype(np.float32)
+
+    def prepare(self, redis_client: redis.Redis) -> None:
+        # Optionally customize pool size before initialization
+        self.set_vector_pool_size(2000)  # Default is 1000
+        super().prepare(redis_client)  # This initializes the pool
+
+    def execute_query(self, redis_client: redis.Redis) -> dict:
+        query_vector = self.get_vector_from_pool()
+        # ... rest of your query logic
+```
+
+### Benefits of Vector Pool
+
+- **🚀 Better Performance**: Eliminates vector generation overhead from timing measurements
+- **📊 More Accurate Metrics**: Query latency only includes actual search time
+- **🎯 Consistent Results**: Same set of vectors used across benchmark runs
+- **⚡ Thread-Safe**: Pool efficiently distributes vectors across concurrent workers
 
 ## Advanced Usage
 
