@@ -18,7 +18,7 @@ class TestRedisConnectionConfig:
         assert config.password is None
         assert config.username is None
         assert config.db == 0
-        assert config.ssl is False
+        assert config.tls is False
 
     def test_custom_values(self):
         """Test custom configuration values."""
@@ -28,14 +28,14 @@ class TestRedisConnectionConfig:
             password="secret",
             username="user",
             db=1,
-            ssl=True
+            tls=True
         )
         assert config.host == "redis.example.com"
         assert config.port == 16379
         assert config.password == "secret"
         assert config.username == "user"
         assert config.db == 1
-        assert config.ssl is True
+        assert config.tls is True
 
     def test_port_validation(self):
         """Test port validation."""

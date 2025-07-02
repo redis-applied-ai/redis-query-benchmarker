@@ -53,12 +53,16 @@ class BenchmarkResults:
         if not self.latencies or not self.result_counts or len(self.latencies) != len(self.result_counts):
             return 0.0
 
-        normalized_latencies = []
-        for latency, count in zip(self.latencies, self.result_counts):
-            if count > 0:
-                normalized_latencies.append(latency / count)
+        # Use numpy for vectorized operations - much faster
+        latencies_array = np.array(self.latencies)
+        counts_array = np.array(self.result_counts)
 
-        return np.mean(normalized_latencies) if normalized_latencies else 0.0
+        # Only include queries that returned results (count > 0)
+        valid_mask = counts_array > 0
+        if not np.any(valid_mask):
+            return 0.0
+
+        return float(np.mean(latencies_array[valid_mask] / counts_array[valid_mask]))
 
     def get_latency_stats(self) -> Dict[str, float]:
         """Calculate latency statistics."""
@@ -86,12 +90,15 @@ class BenchmarkResults:
         bins = [0, 100, 200, 500, 1000, 2000, float("inf")]
         labels = ["<100ms", "100-200ms", "200-500ms", "500ms-1s", "1-2s", ">2s"]
 
+        # Use numpy histogram for O(n) performance instead of O(n*bins)
+        latencies_array = np.array(self.latencies)
+        counts, _ = np.histogram(latencies_array, bins=bins)
+
+        total = len(self.latencies)
         distribution = []
-        for i, (bin_max, label) in enumerate(zip(bins[1:], labels)):
-            bin_min = bins[i]
-            count = sum(1 for lat in self.latencies if bin_min <= lat < bin_max)
-            percentage = (count / len(self.latencies)) * 100
-            distribution.append((label, count, percentage))
+        for count, label in zip(counts, labels):
+            percentage = (count / total) * 100
+            distribution.append((label, int(count), percentage))
 
         return distribution
 
@@ -120,21 +127,28 @@ class RedisBenchmarker:
                 pool_kwargs["password"] = self.config.redis.password
             if self.config.redis.username:
                 pool_kwargs["username"] = self.config.redis.username
-            if self.config.redis.ssl:
-                pool_kwargs["ssl"] = True
+
+            # Configure TLS/SSL if enabled - use SSLConnection class for TLS
+            if self.config.redis.tls:
+                pool_kwargs.update({
+                    "connection_class": redis.connection.SSLConnection,
+                    "ssl_cert_reqs": "none" if self.config.redis.tls_insecure else "required",
+                    "ssl_check_hostname": not self.config.redis.tls_insecure,
+                })
+            else:
+                pool_kwargs["connection_class"] = redis.connection.Connection
 
             self._connection_pool = redis.ConnectionPool(**pool_kwargs)
 
         return self._connection_pool
 
     def _get_redis_client(self) -> redis.Redis:
-        """Get Redis client from connection pool."""
-        pool = self._create_connection_pool()
-        return redis.Redis(connection_pool=pool)
+        """Get Redis client using the connection pool."""
+        return redis.Redis(connection_pool=self._create_connection_pool())
 
-    def _execute_single_query(self, executor: BaseQueryExecutor) -> Dict[str, Any]:
+    def _execute_single_query(self, executor: BaseQueryExecutor, connection_pool: redis.ConnectionPool) -> Dict[str, Any]:
         """Execute a single query with error handling."""
-        redis_client = self._get_redis_client()
+        redis_client = redis.Redis(connection_pool=connection_pool)
         try:
             return executor.execute_query(redis_client)
         except Exception as e:
@@ -144,8 +158,7 @@ class RedisBenchmarker:
                 "result": None,
                 "metadata": {}
             }
-        finally:
-            redis_client.close()
+        # Note: Don't close the client when using connection pool - connections are reused
 
     def _extract_result_count(self, query_result: Dict[str, Any]) -> int:
         """Extract result count from query result metadata."""
@@ -177,9 +190,12 @@ class RedisBenchmarker:
 
         self.console.print(f"Running {self.config.warmup_requests} warmup queries...")
 
+        # Create connection pool for warmup
+        connection_pool = self._create_connection_pool()
+
         with ThreadPoolExecutor(max_workers=min(self.config.workers, 8)) as executor_pool:
             futures = [
-                executor_pool.submit(self._execute_single_query, executor)
+                executor_pool.submit(self._execute_single_query, executor, connection_pool)
                 for _ in range(self.config.warmup_requests)
             ]
 
@@ -188,6 +204,31 @@ class RedisBenchmarker:
                     future.result()  # Just consume the result
                 except Exception:
                     pass  # Ignore warmup errors
+
+    def _calculate_metrics(self, start_time: float, successful_count: int, total_latency: float, total_result_count: int) -> Dict[str, float]:
+        """Calculate current metrics efficiently."""
+        elapsed_time = time.time() - start_time
+
+        if successful_count > 0:
+            avg_latency = total_latency / successful_count
+            avg_results = total_result_count / successful_count
+        else:
+            avg_latency = 0.0
+            avg_results = 0.0
+
+        if elapsed_time > 0:
+            current_qps = successful_count / elapsed_time
+        else:
+            current_qps = 0.0
+
+        norm_latency = avg_latency / avg_results if avg_results > 0 else 0.0
+
+        return {
+            "avg_latency": avg_latency,
+            "avg_results": avg_results,
+            "current_qps": current_qps,
+            "norm_latency": norm_latency
+        }
 
     def run_benchmark(self) -> BenchmarkResults:
         """Run the main benchmark."""
@@ -219,10 +260,12 @@ class RedisBenchmarker:
         # Run main benchmark
         self.console.print(f"Starting benchmark with {self.config.total_requests} requests using {self.config.workers} workers...")
 
-        results = []
-        latencies = []
-        errors = []
-        result_counts = []
+        # Preallocate lists for better memory efficiency - use deque for O(1) appends
+        from collections import deque
+        results = deque()
+        latencies = deque()
+        errors = deque()
+        result_counts = deque()
 
         start_time = time.time()
 
@@ -255,167 +298,141 @@ class RedisBenchmarker:
 
         progress_columns.append(TimeRemainingColumn())
 
+        interrupted = False
+        interrupt_time = None
+        # Create connection pool once for all workers
+        connection_pool = self._create_connection_pool()
+
         with Progress(
-            *progress_columns,
-            console=self.console,
-            expand=True
-        ) as progress:
-            task_fields = {
-                "avg_latency": 0.0,
-                "current_qps": 0.0
-            }
+                *progress_columns,
+                console=self.console,
+                expand=True
+            ) as progress:
+                task_fields = {
+                    "avg_latency": 0.0,
+                    "current_qps": 0.0
+                }
 
-            if self.config.show_expanded_metrics:
-                task_fields.update({
-                    "avg_results": 0.0,
-                    "norm_latency": 0.0
-                })
+                if self.config.show_expanded_metrics:
+                    task_fields.update({
+                        "avg_results": 0.0,
+                        "norm_latency": 0.0
+                    })
 
-            task = progress.add_task(
-                "Benchmarking...",
-                total=self.config.total_requests,
-                **task_fields
-            )
+                task = progress.add_task(
+                    "Benchmarking...",
+                    total=self.config.total_requests,
+                    **task_fields
+                )
 
-            with ThreadPoolExecutor(max_workers=self.config.workers) as thread_executor:
-                futures_queue = deque()
-                submission_complete = threading.Event()
+                # Use ThreadPoolExecutor with simplified future management
+                with ThreadPoolExecutor(max_workers=self.config.workers) as thread_executor:
+                    try:
+                        # Submit all futures at once (with QPS limiting if needed)
+                        futures = []
+                        if self.config.qps:
+                            # QPS limited submission
+                            next_submit_time = time.time()
+                            for i in range(self.config.total_requests):
+                                now = time.time()
+                                if now < next_submit_time:
+                                    time.sleep(next_submit_time - now)
+                                next_submit_time = max(next_submit_time + 1.0 / self.config.qps, time.time())
 
-                def submit_futures():
-                    """Submit futures with QPS limiting in a separate thread."""
-                    qps = self.config.qps
-                    next_submit_time = time.time()
-                    for i in range(self.config.total_requests):
-                        now = time.time()
-                        if qps:
-                            # Wait until the next allowed submission time
-                            if now < next_submit_time:
-                                time.sleep(next_submit_time - now)
-                            next_submit_time = max(next_submit_time + 1.0 / qps, time.time())
+                                future = thread_executor.submit(self._execute_single_query, executor, connection_pool)
+                                futures.append(future)
+                        else:
+                            # No QPS limit - submit all at once
+                            futures = [
+                                thread_executor.submit(self._execute_single_query, executor, connection_pool)
+                                for _ in range(self.config.total_requests)
+                            ]
 
-                        future = thread_executor.submit(self._execute_single_query, executor)
-                        futures_queue.append(future)
+                        # Process completions using as_completed for efficiency
+                        completed_count = 0
+                        batch_size = max(1, self.config.workers // 4)  # Update progress in batches
+                        batch_count = 0
 
-                    submission_complete.set()
+                        for future in as_completed(futures):
+                            try:
+                                query_result = future.result(timeout=self.config.timeout)
 
-                # Start submission thread
-                submission_thread = threading.Thread(target=submit_futures)
-                submission_thread.start()
+                                if "error" in query_result:
+                                    errors.append(query_result["error"])
+                                else:
+                                    results.append(query_result["result"])
+                                    latencies.append(query_result["latency_ms"])
 
-                # Process completions as they become available
-                completed_count = 0
-                processed_futures = set()
+                                    # Extract result count from metadata
+                                    result_count = self._extract_result_count(query_result)
+                                    result_counts.append(result_count)
 
-                while completed_count < self.config.total_requests:
-                    # Collect available futures
-                    available_futures = []
-                    while futures_queue:
-                        try:
-                            future = futures_queue.popleft()
-                            if future not in processed_futures:
-                                available_futures.append(future)
-                        except IndexError:
-                            break
+                                    # Update running averages efficiently
+                                    total_latency += query_result["latency_ms"]
+                                    total_result_count += result_count
+                                    successful_count += 1
 
-                    # Process any completed futures
-                    if available_futures:
-                        # Check which futures are done (non-blocking)
-                        for future in available_futures:
-                            if future.done() and future not in processed_futures:
-                                processed_futures.add(future)
-                                try:
-                                    query_result = future.result(timeout=self.config.timeout)
+                                completed_count += 1
+                                batch_count += 1
 
-                                    if "error" in query_result:
-                                        errors.append(query_result["error"])
-                                    else:
-                                        results.append(query_result["result"])
-                                        latencies.append(query_result["latency_ms"])
-
-                                        # Extract result count from metadata
-                                        result_count = self._extract_result_count(query_result)
-                                        result_counts.append(result_count)
-
-                                        # Update running averages efficiently
-                                        total_latency += query_result["latency_ms"]
-                                        total_result_count += result_count
-                                        successful_count += 1
-
-                                    # Calculate real-time metrics
-                                    elapsed_time = time.time() - start_time
-
-                                    # Calculate average latency using running totals
-                                    if successful_count > 0:
-                                        avg_latency = total_latency / successful_count
-                                        avg_results = total_result_count / successful_count
-                                    else:
-                                        avg_latency = 0.0
-                                        avg_results = 0.0
-
-                                    if elapsed_time > 0:
-                                        current_qps = successful_count / elapsed_time
-                                    else:
-                                        current_qps = 0.0
-
-                                    # Calculate normalized latency
-                                    norm_latency = avg_latency / avg_results if avg_results > 0 else 0.0
+                                # Update progress in batches to reduce overhead
+                                if batch_count >= batch_size or completed_count == self.config.total_requests:
+                                    metrics = self._calculate_metrics(start_time, successful_count, total_latency, total_result_count)
 
                                     # Update progress bar with new metrics
-                                    progress.advance(task)
-                                    update_fields = {"avg_latency": avg_latency, "current_qps": current_qps}
+                                    progress.update(task, completed=completed_count)
+                                    update_fields = {"avg_latency": metrics["avg_latency"], "current_qps": metrics["current_qps"]}
 
                                     if self.config.show_expanded_metrics:
                                         update_fields.update({
-                                            "avg_results": avg_results,
-                                            "norm_latency": norm_latency
+                                            "avg_results": metrics["avg_results"],
+                                            "norm_latency": metrics["norm_latency"]
                                         })
 
                                     progress.update(task, **update_fields)
-                                    completed_count += 1
+                                    batch_count = 0
 
-                                except Exception as e:
-                                    errors.append(str(e))
-                                    elapsed_time = time.time() - start_time
+                            except Exception as e:
+                                errors.append(str(e))
+                                completed_count += 1
+                                batch_count += 1
 
-                                    # Calculate metrics even on error
-                                    if successful_count > 0:
-                                        avg_latency = total_latency / successful_count
-                                        avg_results = total_result_count / successful_count
-                                    else:
-                                        avg_latency = 0.0
-                                        avg_results = 0.0
+                                # Update progress even on error (batched)
+                                if batch_count >= batch_size or completed_count == self.config.total_requests:
+                                    metrics = self._calculate_metrics(start_time, successful_count, total_latency, total_result_count)
 
-                                    if elapsed_time > 0:
-                                        current_qps = successful_count / elapsed_time
-                                    else:
-                                        current_qps = 0.0
-
-                                    # Calculate normalized latency
-                                    norm_latency = avg_latency / avg_results if avg_results > 0 else 0.0
-
-                                    progress.advance(task)
-                                    update_fields = {"avg_latency": avg_latency, "current_qps": current_qps}
+                                    progress.update(task, completed=completed_count)
+                                    update_fields = {"avg_latency": metrics["avg_latency"], "current_qps": metrics["current_qps"]}
 
                                     if self.config.show_expanded_metrics:
                                         update_fields.update({
-                                            "avg_results": avg_results,
-                                            "norm_latency": norm_latency
+                                            "avg_results": metrics["avg_results"],
+                                            "norm_latency": metrics["norm_latency"]
                                         })
 
                                     progress.update(task, **update_fields)
-                                    completed_count += 1
-                            else:
-                                # Put back unfinished futures for next iteration
-                                futures_queue.appendleft(future)
+                                    batch_count = 0
 
-                    # Small sleep to avoid busy waiting, but only if no futures completed this iteration
-                    if not any(f.done() for f in available_futures):
-                        time.sleep(0.01)
+                    except KeyboardInterrupt:
+                        interrupted = True
+                        interrupt_time = time.time()
 
-                # Wait for submission thread to complete
-                submission_thread.join()
+                        # Print message immediately
+                        self.console.print("\n[yellow]Benchmark interrupted by user. Collecting partial results...[/yellow]")
 
-        end_time = time.time()
+                        # Cancel any pending futures
+                        for future in futures:
+                            if not future.done():
+                                future.cancel()
+
+                        # Stop progress display
+                        try:
+                            progress.stop()
+                        except:
+                            pass
+
+        # Calculate end time - use interrupt time if interrupted, otherwise current time
+        end_time = interrupt_time if interrupted else time.time()
         total_time = end_time - start_time
 
         # Cleanup
@@ -430,15 +447,17 @@ class RedisBenchmarker:
             successful_requests=len(latencies),
             failed_requests=len(errors),
             total_time=total_time,
-            latencies=latencies,
-            errors=errors,
+            latencies=list(latencies),  # Convert deque to list for final results
+            errors=list(errors),
             metadata={
                 "query_type": self.config.query_type,
                 "workers": self.config.workers,
                 "redis_host": f"{self.config.redis.host}:{self.config.redis.port}",
+                "interrupted": interrupted,
+                "completed_requests": len(latencies) + len(errors),
             },
             config=self.config,
-            result_counts=result_counts
+            result_counts=list(result_counts)
         )
 
     def format_results(self, results: BenchmarkResults) -> str:
@@ -447,6 +466,12 @@ class RedisBenchmarker:
         output.append("Redis Query Benchmarker Results")
         output.append("=" * 40)
         output.append("")
+
+        # Show interruption status if applicable
+        if results.metadata.get("interrupted", False):
+            completed = results.metadata.get("completed_requests", results.successful_requests + results.failed_requests)
+            output.append(f"[INTERRUPTED] Benchmark was stopped early (completed {completed}/{results.total_requests} requests)")
+            output.append("")
 
         # Configuration
         output.append("Configuration:")

@@ -2,6 +2,7 @@
 
 import click
 import sys
+import os
 from typing import Dict, Any
 
 from .config import BenchmarkConfig, RedisConnectionConfig
@@ -15,7 +16,8 @@ from .executors import list_query_executors
 @click.option('--password', default=None, help='Redis password')
 @click.option('--username', default=None, help='Redis username')
 @click.option('--db', default=0, help='Redis database number')
-@click.option('--ssl', is_flag=True, help='Use SSL connection')
+@click.option('--tls', is_flag=True, help='Use TLS connection')
+@click.option('--insecure', is_flag=True, help='Skip TLS certificate validation (allows self-signed certificates)')
 @click.option('--total-requests', default=1000, help='Total number of requests')
 @click.option('--workers', default=16, help='Number of worker threads')
 @click.option('--query-type', default='vector_search',
@@ -54,7 +56,8 @@ def main(**kwargs):
                 password=kwargs['password'],
                 username=kwargs['username'],
                 db=kwargs['db'],
-                ssl=kwargs['ssl'],
+                tls=kwargs['tls'],
+                tls_insecure=kwargs['insecure'],
                 max_connections=kwargs['max_connections']
             )
 
@@ -108,21 +111,33 @@ def main(**kwargs):
         click.echo()
 
         benchmarker = RedisBenchmarker(config)
-        results = benchmarker.run_benchmark()
+        try:
+            results = benchmarker.run_benchmark()
+        except KeyboardInterrupt:
+            # This shouldn't happen since run_benchmark handles KeyboardInterrupt
+            # But if it does, we still want to exit gracefully
+            click.echo("\nBenchmark interrupted by user.", err=True)
+            os._exit(1)
 
-        # Output results
+        # Output results (including partial results if interrupted)
         if config.output_format == 'console':
             benchmarker.print_results(results)
 
         if config.output_file:
             benchmarker.save_results(results, config.output_file, config.output_format)
 
-        # Exit with error code if there were failures
-        if results.failed_requests > 0:
+        # Exit with appropriate code
+        if results.metadata.get("interrupted", False):
+            click.echo(f"\nBenchmark was interrupted. Partial results shown above.", err=True)
+            os._exit(1)
+        elif results.failed_requests > 0:
             click.echo(f"\nWarning: {results.failed_requests} requests failed", err=True)
             if results.success_rate < 95:
                 sys.exit(1)
 
+    except KeyboardInterrupt:
+        click.echo("\nBenchmark interrupted by user.", err=True)
+        os._exit(1)
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         if kwargs.get('verbose'):
