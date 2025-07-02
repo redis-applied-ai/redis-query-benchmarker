@@ -113,6 +113,9 @@ class BaseQueryExecutor(ABC, metaclass=AutoMainMeta):
 
     def __init__(self, config: "BenchmarkConfig"):
         self.config = config
+        self._vector_pool: List[np.ndarray] = []
+        self._vector_pool_index = 0
+        self._vector_pool_size = 1000  # Default pool size
 
     @abstractmethod
     def execute_query(self, redis_client: redis.Redis) -> Dict[str, Any]:
@@ -132,7 +135,60 @@ class BaseQueryExecutor(ABC, metaclass=AutoMainMeta):
 
     def prepare(self, redis_client: redis.Redis) -> None:
         """Optional preparation step before benchmarking starts."""
-        pass
+        # Pre-generate vector pool for performance
+        self._initialize_vector_pool()
+
+    def _initialize_vector_pool(self) -> None:
+        """Initialize the vector pool with pre-generated vectors."""
+        if not self._vector_pool:  # Only initialize if empty
+            print(f"Pre-generating {self._vector_pool_size} vectors of dimension {self.config.vector_dim} for performance...")
+            self._vector_pool = []
+            for _ in range(self._vector_pool_size):
+                vector = self.make_single_vector()
+                self._vector_pool.append(vector)
+            print(f"Vector pool initialized with {len(self._vector_pool)} vectors")
+
+    def make_single_vector(self) -> np.ndarray:
+        """
+        Generate a single random vector. Override this method to customize vector generation.
+
+        Returns:
+            np.ndarray: Random vector of shape (vector_dim,) as float32
+        """
+        return np.random.random(self.config.vector_dim).astype(np.float32)
+
+    def get_vector_from_pool(self) -> np.ndarray:
+        """
+        Get a pre-generated vector from the pool for use in queries.
+
+        This method is thread-safe and cycles through the pool.
+        The returned vector should be used immediately (e.g., converted to list/bytes)
+        and not modified to ensure thread safety.
+
+        Returns:
+            np.ndarray: A vector from the pre-generated pool (direct reference, no copy)
+        """
+        if not self._vector_pool:
+            # Fallback if pool not initialized
+            return self.make_single_vector()
+
+        # Use modulo to cycle through the pool (thread-safe for reads)
+        vector = self._vector_pool[self._vector_pool_index % len(self._vector_pool)]
+        self._vector_pool_index = (self._vector_pool_index + 1) % len(self._vector_pool)
+        return vector  # Return direct reference for maximum performance
+
+    def set_vector_pool_size(self, size: int) -> None:
+        """
+        Set the vector pool size. Call this before prepare() to take effect.
+
+        Args:
+            size: Number of vectors to pre-generate
+        """
+        if size < 1:
+            raise ValueError("Vector pool size must be at least 1")
+        self._vector_pool_size = size
+        # Clear existing pool so it gets regenerated with new size
+        self._vector_pool = []
 
     def cleanup(self, redis_client: redis.Redis) -> None:
         """Optional cleanup step after benchmarking ends."""
@@ -189,8 +245,8 @@ class VectorSearchExecutor(BaseQueryExecutor):
             else:
                 raise ValueError("No index name provided for vector search")
 
-        # Generate random vector
-        vector = np.random.random(self.config.vector_dim).astype(np.float32).tolist()
+        # Get pre-generated vector from pool
+        vector = self.get_vector_from_pool().tolist()
 
         query = VectorQuery(
             vector=vector,
@@ -236,7 +292,7 @@ class HybridSearchExecutor(BaseQueryExecutor):
             else:
                 raise ValueError("No index name provided for hybrid search")
 
-        vector = np.random.random(self.config.vector_dim).astype(np.float32).tolist()
+        vector = self.get_vector_from_pool().tolist()
 
         query = VectorQuery(
             vector=vector,
