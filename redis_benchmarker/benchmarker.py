@@ -7,6 +7,7 @@ import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional, Tuple
+import random
 from dataclasses import dataclass
 import redis
 import numpy as np
@@ -16,6 +17,125 @@ from rich.progress import Progress, TaskID, BarColumn, TextColumn, TimeRemaining
 
 from .config import BenchmarkConfig
 from .executors import BaseQueryExecutor, get_query_executor
+
+
+class OnlineStatsCalculator:
+    """Calculates statistics incrementally without storing all values."""
+    
+    def __init__(self):
+        self.count = 0
+        self.min_val = float('inf')
+        self.max_val = float('-inf')
+        self.sum_val = 0.0
+        self.sum_sq = 0.0
+        self.values_for_percentiles = []  # Only keep sample for percentiles
+        self.max_samples = 10000  # Limit sample size for percentiles
+        
+        # Histogram buckets for distribution
+        self.bins = [0, 100, 200, 500, 1000, 2000, float("inf")]
+        self.bin_counts = [0] * (len(self.bins) - 1)
+    
+    def add_value(self, value: float):
+        """Add a value and update statistics."""
+        self.count += 1
+        self.min_val = min(self.min_val, value)
+        self.max_val = max(self.max_val, value)
+        self.sum_val += value
+        self.sum_sq += value * value
+        
+        # Update histogram
+        for i in range(len(self.bins) - 1):
+            if self.bins[i] <= value < self.bins[i + 1]:
+                self.bin_counts[i] += 1
+                break
+        
+        # Keep sample for percentiles (reservoir sampling)
+        if len(self.values_for_percentiles) < self.max_samples:
+            self.values_for_percentiles.append(value)
+        else:
+            # Replace random element
+            idx = random.randint(0, self.count - 1)
+            if idx < self.max_samples:
+                self.values_for_percentiles[idx] = value
+    
+    def get_stats(self) -> Dict[str, float]:
+        """Get computed statistics."""
+        if self.count == 0:
+            return {}
+        
+        mean = self.sum_val / self.count
+        variance = (self.sum_sq / self.count) - (mean * mean)
+        std_dev = variance ** 0.5 if variance > 0 else 0.0
+        
+        stats = {
+            "count": self.count,
+            "average": mean,
+            "min": self.min_val if self.min_val != float('inf') else 0.0,
+            "max": self.max_val if self.max_val != float('-inf') else 0.0,
+            "std_dev": std_dev,
+        }
+        
+        # Calculate percentiles from sample
+        if self.values_for_percentiles:
+            sample_array = np.array(self.values_for_percentiles)
+            stats.update({
+                "median": float(np.median(sample_array)),
+                "p90": float(np.percentile(sample_array, 90)),
+                "p95": float(np.percentile(sample_array, 95)),
+                "p99": float(np.percentile(sample_array, 99)),
+            })
+        
+        return stats
+    
+    def get_distribution(self) -> List[Tuple[str, int, float]]:
+        """Get latency distribution."""
+        if self.count == 0:
+            return []
+        
+        labels = ["<100ms", "100-200ms", "200-500ms", "500ms-1s", "1-2s", ">2s"]
+        distribution = []
+        for count, label in zip(self.bin_counts, labels):
+            percentage = (count / self.count) * 100
+            distribution.append((label, count, percentage))
+        
+        return distribution
+
+
+class ThreadSafeCounters:
+    """Thread-safe counters for tracking benchmark progress."""
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.completed_count = 0
+        self.successful_count = 0
+        self.total_latency = 0.0
+        self.total_result_count = 0
+        self.errors_count = 0
+    
+    def update_success(self, latency_ms: float, result_count: int) -> None:
+        """Update counters for a successful query."""
+        with self._lock:
+            self.completed_count += 1
+            self.successful_count += 1
+            self.total_latency += latency_ms
+            self.total_result_count += result_count
+    
+    def update_error(self) -> None:
+        """Update counters for a failed query."""
+        with self._lock:
+            self.completed_count += 1
+            self.errors_count += 1
+    
+    def get_snapshot(self) -> Dict[str, Any]:
+        """Get a thread-safe snapshot of current counters."""
+        with self._lock:
+            return {
+                'completed_count': self.completed_count,
+                'successful_count': self.successful_count,
+                'total_latency': self.total_latency,
+                'total_result_count': self.total_result_count,
+                'errors_count': self.errors_count
+            }
 
 
 @dataclass
@@ -31,6 +151,10 @@ class BenchmarkResults:
     metadata: Dict[str, Any]
     config: BenchmarkConfig
     result_counts: List[int]
+    
+    # Statistics computed during benchmark to avoid storing raw data
+    latency_stats: Optional[Dict[str, float]] = None
+    latency_distribution: Optional[List[Tuple[str, int, float]]] = None
 
     @property
     def qps(self) -> float:
@@ -66,6 +190,10 @@ class BenchmarkResults:
 
     def get_latency_stats(self) -> Dict[str, float]:
         """Calculate latency statistics."""
+        # Return precomputed stats if available to avoid recalculation
+        if self.latency_stats is not None:
+            return self.latency_stats
+            
         if not self.latencies:
             return {}
 
@@ -84,6 +212,10 @@ class BenchmarkResults:
 
     def get_latency_distribution(self) -> List[Tuple[str, int, float]]:
         """Get latency distribution in buckets."""
+        # Return precomputed distribution if available
+        if self.latency_distribution is not None:
+            return self.latency_distribution
+            
         if not self.latencies:
             return []
 
@@ -230,6 +362,43 @@ class RedisBenchmarker:
             "norm_latency": norm_latency
         }
 
+    def _progress_updater_thread(self, progress: Progress, task: TaskID, counters: ThreadSafeCounters, 
+                                 start_time: float, stop_event: threading.Event) -> None:
+        """Background thread that automatically updates progress bar every 0.5 seconds."""
+        while not stop_event.is_set():
+            try:
+                # Get current snapshot of counters
+                snapshot = counters.get_snapshot()
+                
+                # Calculate metrics from snapshot
+                metrics = self._calculate_metrics(
+                    start_time, 
+                    snapshot['successful_count'], 
+                    snapshot['total_latency'], 
+                    snapshot['total_result_count']
+                )
+                
+                # Update progress bar
+                update_fields = {
+                    "avg_latency": metrics["avg_latency"], 
+                    "current_qps": metrics["current_qps"]
+                }
+                
+                if self.config.show_expanded_metrics:
+                    update_fields.update({
+                        "avg_results": metrics["avg_results"],
+                        "norm_latency": metrics["norm_latency"]
+                    })
+                
+                progress.update(task, completed=snapshot['completed_count'], **update_fields)
+                
+                # Update every 0.5 seconds
+                stop_event.wait(0.5)
+                
+            except Exception:
+                # Ignore any errors in progress updates to avoid breaking the benchmark
+                stop_event.wait(0.5)
+
     def run_benchmark(self) -> BenchmarkResults:
         """Run the main benchmark."""
         # Get query executor
@@ -260,19 +429,21 @@ class RedisBenchmarker:
         # Run main benchmark
         self.console.print(f"Starting benchmark with {self.config.total_requests} requests using {self.config.workers} workers...")
 
-        # Preallocate lists for better memory efficiency - use deque for O(1) appends
-        from collections import deque
-        results = deque()
-        latencies = deque()
-        errors = deque()
-        result_counts = deque()
+        # Use incremental statistics to avoid storing all data in memory
+        latency_stats_calc = OnlineStatsCalculator()
+        
+        # Only store a sample of raw data for exports (limit to prevent OOM)
+        max_raw_samples = min(10000, self.config.total_requests // 10)
+        latencies_sample = deque(maxlen=max_raw_samples)
+        result_counts_sample = deque(maxlen=max_raw_samples)
+        
+        # Keep limited error samples
+        errors = deque(maxlen=1000)  # Limit error storage
 
         start_time = time.time()
 
-        # Variables for efficient running average calculation
-        total_latency = 0.0
-        total_result_count = 0
-        successful_count = 0
+        # Thread-safe counters for progress tracking
+        counters = ThreadSafeCounters()
 
         # Custom progress bar with real-time metrics
         progress_columns = [
@@ -324,6 +495,15 @@ class RedisBenchmarker:
                     total=self.config.total_requests,
                     **task_fields
                 )
+                
+                # Start background progress updater thread
+                stop_progress_event = threading.Event()
+                progress_thread = threading.Thread(
+                    target=self._progress_updater_thread,
+                    args=(progress, task, counters, start_time, stop_progress_event),
+                    daemon=True
+                )
+                progress_thread.start()
 
                 # Use ThreadPoolExecutor with simplified future management
                 with ThreadPoolExecutor(max_workers=self.config.workers) as thread_executor:
@@ -335,10 +515,6 @@ class RedisBenchmarker:
                         ]
 
                         # Process completions using as_completed for efficiency
-                        completed_count = 0
-                        batch_size = max(1, self.config.workers // 4)  # Update progress in batches
-                        batch_count = 0
-                        
                         # QPS limiting variables
                         qps_start_time = time.time() if self.config.qps else None
                         qps_completed_count = 0
@@ -349,22 +525,22 @@ class RedisBenchmarker:
 
                                 if "error" in query_result:
                                     errors.append(query_result["error"])
+                                    counters.update_error()
                                 else:
-                                    results.append(query_result["result"])
-                                    latencies.append(query_result["latency_ms"])
-
+                                    # Update incremental statistics
+                                    latency_ms = query_result["latency_ms"]
+                                    latency_stats_calc.add_value(latency_ms)
+                                    
+                                    # Keep samples for export
+                                    latencies_sample.append(latency_ms)
+                                    
                                     # Extract result count from metadata
                                     result_count = self._extract_result_count(query_result)
-                                    result_counts.append(result_count)
+                                    result_counts_sample.append(result_count)
 
-                                    # Update running averages efficiently
-                                    total_latency += query_result["latency_ms"]
-                                    total_result_count += result_count
-                                    successful_count += 1
+                                    # Update thread-safe counters (progress thread will read these)
+                                    counters.update_success(latency_ms, result_count)
                                     qps_completed_count += 1
-
-                                completed_count += 1
-                                batch_count += 1
                                 
                                 # Apply QPS limiting if configured
                                 if self.config.qps and qps_start_time:
@@ -373,43 +549,12 @@ class RedisBenchmarker:
                                     if elapsed_time < expected_time:
                                         time.sleep(expected_time - elapsed_time)
 
-                                # Update progress in batches to reduce overhead
-                                if batch_count >= batch_size or completed_count == self.config.total_requests:
-                                    metrics = self._calculate_metrics(start_time, successful_count, total_latency, total_result_count)
-
-                                    # Update progress bar with new metrics
-                                    progress.update(task, completed=completed_count)
-                                    update_fields = {"avg_latency": metrics["avg_latency"], "current_qps": metrics["current_qps"]}
-
-                                    if self.config.show_expanded_metrics:
-                                        update_fields.update({
-                                            "avg_results": metrics["avg_results"],
-                                            "norm_latency": metrics["norm_latency"]
-                                        })
-
-                                    progress.update(task, **update_fields)
-                                    batch_count = 0
-
                             except Exception as e:
                                 errors.append(str(e))
-                                completed_count += 1
-                                batch_count += 1
-
-                                # Update progress even on error (batched)
-                                if batch_count >= batch_size or completed_count == self.config.total_requests:
-                                    metrics = self._calculate_metrics(start_time, successful_count, total_latency, total_result_count)
-
-                                    progress.update(task, completed=completed_count)
-                                    update_fields = {"avg_latency": metrics["avg_latency"], "current_qps": metrics["current_qps"]}
-
-                                    if self.config.show_expanded_metrics:
-                                        update_fields.update({
-                                            "avg_results": metrics["avg_results"],
-                                            "norm_latency": metrics["norm_latency"]
-                                        })
-
-                                    progress.update(task, **update_fields)
-                                    batch_count = 0
+                                counters.update_error()
+                        
+                        # Stop progress updater thread when benchmark completes normally
+                        stop_progress_event.set()
 
                     except KeyboardInterrupt:
                         interrupted = True
@@ -422,6 +567,9 @@ class RedisBenchmarker:
                         for future in futures:
                             if not future.done():
                                 future.cancel()
+
+                        # Stop progress updater thread
+                        stop_progress_event.set()
 
                         # Stop progress display
                         try:
@@ -440,22 +588,32 @@ class RedisBenchmarker:
         finally:
             cleanup_client.close()
 
+        # Get final statistics from incremental calculator
+        final_latency_stats = latency_stats_calc.get_stats()
+        final_latency_distribution = latency_stats_calc.get_distribution()
+        
+        successful_requests = latency_stats_calc.count
+        failed_requests = len(errors)
+
         return BenchmarkResults(
             total_requests=self.config.total_requests,
-            successful_requests=len(latencies),
-            failed_requests=len(errors),
+            successful_requests=successful_requests,
+            failed_requests=failed_requests,
             total_time=total_time,
-            latencies=list(latencies),  # Convert deque to list for final results
+            latencies=list(latencies_sample),  # Only sample data
             errors=list(errors),
             metadata={
                 "query_type": self.config.query_type,
                 "workers": self.config.workers,
                 "redis_host": f"{self.config.redis.host}:{self.config.redis.port}",
                 "interrupted": interrupted,
-                "completed_requests": len(latencies) + len(errors),
+                "completed_requests": successful_requests + failed_requests,
+                "note": f"Latency data is sampled (max {max_raw_samples} samples) to prevent OOM",
             },
             config=self.config,
-            result_counts=list(result_counts)
+            result_counts=list(result_counts_sample),
+            latency_stats=final_latency_stats,
+            latency_distribution=final_latency_distribution
         )
 
     def format_results(self, results: BenchmarkResults) -> str:
@@ -544,8 +702,9 @@ class RedisBenchmarker:
                     {"bucket": label, "count": count, "percentage": percentage}
                     for label, count, percentage in results.get_latency_distribution()
                 ],
-                "raw_latencies": results.latencies,
-                "raw_result_counts": results.result_counts,
+                "raw_latencies": results.latencies if len(results.latencies) <= 10000 else [],
+                "raw_result_counts": results.result_counts if len(results.result_counts) <= 10000 else [],
+                "sampling_note": "Raw data excluded for large datasets to prevent memory issues" if len(results.latencies) > 10000 else None,
                 "errors": results.errors,
                 "metadata": results.metadata,
             }
