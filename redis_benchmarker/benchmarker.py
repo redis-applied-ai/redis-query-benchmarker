@@ -328,30 +328,20 @@ class RedisBenchmarker:
                 # Use ThreadPoolExecutor with simplified future management
                 with ThreadPoolExecutor(max_workers=self.config.workers) as thread_executor:
                     try:
-                        # Submit all futures at once (with QPS limiting if needed)
-                        futures = []
-                        if self.config.qps:
-                            # QPS limited submission
-                            next_submit_time = time.time()
-                            for i in range(self.config.total_requests):
-                                now = time.time()
-                                if now < next_submit_time:
-                                    time.sleep(next_submit_time - now)
-                                next_submit_time = max(next_submit_time + 1.0 / self.config.qps, time.time())
-
-                                future = thread_executor.submit(self._execute_single_query, executor, connection_pool)
-                                futures.append(future)
-                        else:
-                            # No QPS limit - submit all at once
-                            futures = [
-                                thread_executor.submit(self._execute_single_query, executor, connection_pool)
-                                for _ in range(self.config.total_requests)
-                            ]
+                        # Submit all futures at once - QPS limiting will be done during execution
+                        futures = [
+                            thread_executor.submit(self._execute_single_query, executor, connection_pool)
+                            for _ in range(self.config.total_requests)
+                        ]
 
                         # Process completions using as_completed for efficiency
                         completed_count = 0
                         batch_size = max(1, self.config.workers // 4)  # Update progress in batches
                         batch_count = 0
+                        
+                        # QPS limiting variables
+                        qps_start_time = time.time() if self.config.qps else None
+                        qps_completed_count = 0
 
                         for future in as_completed(futures):
                             try:
@@ -371,9 +361,17 @@ class RedisBenchmarker:
                                     total_latency += query_result["latency_ms"]
                                     total_result_count += result_count
                                     successful_count += 1
+                                    qps_completed_count += 1
 
                                 completed_count += 1
                                 batch_count += 1
+                                
+                                # Apply QPS limiting if configured
+                                if self.config.qps and qps_start_time:
+                                    elapsed_time = time.time() - qps_start_time
+                                    expected_time = qps_completed_count / self.config.qps
+                                    if elapsed_time < expected_time:
+                                        time.sleep(expected_time - elapsed_time)
 
                                 # Update progress in batches to reduce overhead
                                 if batch_count >= batch_size or completed_count == self.config.total_requests:
