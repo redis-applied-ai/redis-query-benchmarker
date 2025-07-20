@@ -364,7 +364,10 @@ class RedisBenchmarker:
 
     def _progress_updater_thread(self, progress: Progress, task: TaskID, counters: ThreadSafeCounters, 
                                  start_time: float, stop_event: threading.Event) -> None:
-        """Background thread that automatically updates progress bar every 0.5 seconds."""
+        """Background thread that automatically updates progress bar with adaptive frequency."""
+        # Adaptive update frequency based on total requests
+        update_interval = 0.5 if self.config.total_requests < 100000 else 1.0
+        
         while not stop_event.is_set():
             try:
                 # Get current snapshot of counters
@@ -392,8 +395,8 @@ class RedisBenchmarker:
                 
                 progress.update(task, completed=snapshot['completed_count'], **update_fields)
                 
-                # Update every 0.5 seconds
-                stop_event.wait(0.5)
+                # Adaptive update frequency
+                stop_event.wait(update_interval)
                 
             except Exception:
                 # Ignore any errors in progress updates to avoid breaking the benchmark
@@ -505,53 +508,70 @@ class RedisBenchmarker:
                 )
                 progress_thread.start()
 
-                # Use ThreadPoolExecutor with simplified future management
+                # Use ThreadPoolExecutor with batch future management for large query counts
                 with ThreadPoolExecutor(max_workers=self.config.workers) as thread_executor:
                     try:
-                        # Submit all futures at once - QPS limiting will be done during execution
-                        futures = [
-                            thread_executor.submit(self._execute_single_query, executor, connection_pool)
-                            for _ in range(self.config.total_requests)
-                        ]
-
-                        # Process completions using as_completed for efficiency
+                        # Optimize for large query counts by batching future submission
+                        batch_size = min(10000, self.config.total_requests)
+                        remaining_requests = self.config.total_requests
+                        all_futures = []
+                        
                         # QPS limiting variables
                         qps_start_time = time.time() if self.config.qps else None
                         qps_completed_count = 0
+                        qps_sleep_debt = 0.0  # Track accumulated sleep time for efficiency
 
-                        for future in as_completed(futures):
-                            try:
-                                query_result = future.result(timeout=self.config.timeout)
+                        # Process queries in batches to reduce memory usage and startup time
+                        while remaining_requests > 0:
+                            current_batch_size = min(batch_size, remaining_requests)
+                            
+                            # Submit batch of futures
+                            batch_futures = [
+                                thread_executor.submit(self._execute_single_query, executor, connection_pool)
+                                for _ in range(current_batch_size)
+                            ]
+                            
+                            # Process this batch
+                            for future in as_completed(batch_futures):
+                                try:
+                                    query_result = future.result(timeout=self.config.timeout)
 
-                                if "error" in query_result:
-                                    errors.append(query_result["error"])
+                                    if "error" in query_result:
+                                        errors.append(query_result["error"])
+                                        counters.update_error()
+                                    else:
+                                        # Update incremental statistics
+                                        latency_ms = query_result["latency_ms"]
+                                        latency_stats_calc.add_value(latency_ms)
+                                        
+                                        # Keep samples for export
+                                        latencies_sample.append(latency_ms)
+                                        
+                                        # Extract result count from metadata
+                                        result_count = self._extract_result_count(query_result)
+                                        result_counts_sample.append(result_count)
+
+                                        # Update thread-safe counters (progress thread will read these)
+                                        counters.update_success(latency_ms, result_count)
+                                        qps_completed_count += 1
+                                    
+                                    # Apply optimized QPS limiting if configured
+                                    if self.config.qps and qps_start_time:
+                                        elapsed_time = time.time() - qps_start_time
+                                        expected_time = qps_completed_count / self.config.qps
+                                        sleep_time = expected_time - elapsed_time + qps_sleep_debt
+                                        
+                                        if sleep_time > 0.001:  # Only sleep if meaningful
+                                            time.sleep(sleep_time)
+                                            qps_sleep_debt = 0.0
+                                        else:
+                                            qps_sleep_debt = sleep_time  # Accumulate small delays
+
+                                except Exception as e:
+                                    errors.append(str(e))
                                     counters.update_error()
-                                else:
-                                    # Update incremental statistics
-                                    latency_ms = query_result["latency_ms"]
-                                    latency_stats_calc.add_value(latency_ms)
-                                    
-                                    # Keep samples for export
-                                    latencies_sample.append(latency_ms)
-                                    
-                                    # Extract result count from metadata
-                                    result_count = self._extract_result_count(query_result)
-                                    result_counts_sample.append(result_count)
-
-                                    # Update thread-safe counters (progress thread will read these)
-                                    counters.update_success(latency_ms, result_count)
-                                    qps_completed_count += 1
-                                
-                                # Apply QPS limiting if configured
-                                if self.config.qps and qps_start_time:
-                                    elapsed_time = time.time() - qps_start_time
-                                    expected_time = qps_completed_count / self.config.qps
-                                    if elapsed_time < expected_time:
-                                        time.sleep(expected_time - elapsed_time)
-
-                            except Exception as e:
-                                errors.append(str(e))
-                                counters.update_error()
+                            
+                            remaining_requests -= current_batch_size
                         
                         # Stop progress updater thread when benchmark completes normally
                         stop_progress_event.set()
@@ -563,8 +583,8 @@ class RedisBenchmarker:
                         # Print message immediately
                         self.console.print("\n[yellow]Benchmark interrupted by user. Collecting partial results...[/yellow]")
 
-                        # Cancel any pending futures
-                        for future in futures:
+                        # Cancel any pending futures from all batches
+                        for future in all_futures:
                             if not future.done():
                                 future.cancel()
 
