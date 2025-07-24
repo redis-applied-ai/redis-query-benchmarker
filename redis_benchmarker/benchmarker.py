@@ -435,8 +435,13 @@ class RedisBenchmarker:
         # Use incremental statistics to avoid storing all data in memory
         latency_stats_calc = OnlineStatsCalculator()
         
-        # Only store a sample of raw data for exports (limit to prevent OOM)
-        max_raw_samples = min(10000, self.config.total_requests // 10)
+        # Dramatically reduce memory usage for large benchmarks
+        # Use adaptive sampling - fewer samples for very large tests
+        if self.config.total_requests >= 100000:
+            max_raw_samples = min(1000, self.config.total_requests // 1000)  # Much smaller sample
+        else:
+            max_raw_samples = min(5000, self.config.total_requests // 10)
+        
         latencies_sample = deque(maxlen=max_raw_samples)
         result_counts_sample = deque(maxlen=max_raw_samples)
         
@@ -531,7 +536,7 @@ class RedisBenchmarker:
                                 for _ in range(current_batch_size)
                             ]
                             
-                            # Process this batch
+                            # Process this batch and clear references immediately
                             for future in as_completed(batch_futures):
                                 try:
                                     query_result = future.result(timeout=self.config.timeout)
@@ -571,6 +576,8 @@ class RedisBenchmarker:
                                     errors.append(str(e))
                                     counters.update_error()
                             
+                            # Clear batch futures to free memory immediately
+                            del batch_futures
                             remaining_requests -= current_batch_size
                         
                         # Stop progress updater thread when benchmark completes normally
@@ -601,12 +608,17 @@ class RedisBenchmarker:
         end_time = interrupt_time if interrupted else time.time()
         total_time = end_time - start_time
 
-        # Cleanup
+        # Cleanup resources to prevent memory leaks
         cleanup_client = self._get_redis_client()
         try:
             executor.cleanup(cleanup_client)
         finally:
             cleanup_client.close()
+        
+        # Close connection pool to release all connections
+        if self._connection_pool:
+            self._connection_pool.disconnect()
+            self._connection_pool = None
 
         # Get final statistics from incremental calculator
         final_latency_stats = latency_stats_calc.get_stats()

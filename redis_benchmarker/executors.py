@@ -141,6 +141,10 @@ class BaseQueryExecutor(ABC, metaclass=AutoMainMeta):
     def _initialize_vector_pool(self) -> None:
         """Initialize the vector pool with pre-generated vectors."""
         if not self._vector_pool:  # Only initialize if empty
+            # Reduce vector pool size for large benchmarks to save memory
+            if self.config.total_requests >= 100000:
+                self._vector_pool_size = min(100, self._vector_pool_size)  # Much smaller pool
+                
             print(f"Pre-generating {self._vector_pool_size} vectors of dimension {self.config.vector_dim} for performance...")
             self._vector_pool = []
             for _ in range(self._vector_pool_size):
@@ -192,7 +196,9 @@ class BaseQueryExecutor(ABC, metaclass=AutoMainMeta):
 
     def cleanup(self, redis_client: redis.Redis) -> None:
         """Optional cleanup step after benchmarking ends."""
-        pass
+        # Clear vector pool to free memory
+        self._vector_pool.clear()
+        self._vector_pool_index = 0
 
     @classmethod
     def get_executor_name(cls) -> str:
@@ -227,6 +233,12 @@ class VectorSearchExecutor(BaseQueryExecutor):
         super().__init__(config)
         self.index: Optional[SearchIndex] = None
         self.vector_field = config.vector_field or "embedding"
+        
+    def cleanup(self, redis_client: redis.Redis) -> None:
+        """Cleanup resources and clear index reference."""
+        super().cleanup(redis_client)
+        # Clear index reference to free memory
+        self.index = None
 
     def prepare(self, redis_client: redis.Redis) -> None:
         """Initialize the search index."""
@@ -277,6 +289,12 @@ class HybridSearchExecutor(BaseQueryExecutor):
             "filter_expression",
             "@price:[0 75]"
         )
+        
+    def cleanup(self, redis_client: redis.Redis) -> None:
+        """Cleanup resources and clear index reference."""
+        super().cleanup(redis_client)
+        # Clear index reference to free memory
+        self.index = None
 
     def prepare(self, redis_client: redis.Redis) -> None:
         if self.config.index_name:
