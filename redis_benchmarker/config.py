@@ -17,6 +17,7 @@ class RedisConnectionConfig(BaseModel):
     socket_timeout: float = Field(default=30.0, description="Socket timeout in seconds")
     socket_connect_timeout: float = Field(default=30.0, description="Socket connect timeout")
     max_connections: Optional[int] = Field(default=None, description="Max connections in pool")
+    protocol: int = Field(default=2, description="Redis protocol version (2 or 3)", ge=2, le=3)
 
 
 class BenchmarkConfig(BaseModel):

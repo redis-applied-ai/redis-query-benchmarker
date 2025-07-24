@@ -40,6 +40,7 @@ from .executors import list_query_executors
 @click.option('--search-query', default='*', help='Search query for redis-py search')
 @click.option('--max-connections', default=None, type=int, help='Max connections in pool')
 @click.option('--qps', default=None, type=float, help='Target queries per second (QPS)')
+@click.option('--resp', default=2, type=click.IntRange(2, 3), help='Redis protocol version (2 or 3)')
 def main(**kwargs):
     """Redis Query Benchmarker - Benchmark Redis search queries with configurable executors."""
 
@@ -58,7 +59,8 @@ def main(**kwargs):
                 db=kwargs['db'],
                 tls=kwargs['tls'],
                 tls_insecure=kwargs['insecure'],
-                max_connections=kwargs['max_connections']
+                max_connections=kwargs['max_connections'],
+                protocol=kwargs['resp']
             )
 
             # Build extra params for different query types
@@ -102,6 +104,7 @@ def main(**kwargs):
         click.echo("Redis Query Benchmarker")
         click.echo("=" * 40)
         click.echo(f"Target: {config.redis.host}:{config.redis.port}")
+        click.echo(f"Protocol: RESP{config.redis.protocol}")
         click.echo(f"Query Type: {config.query_type}")
         click.echo(f"Requests: {config.total_requests}")
         click.echo(f"Workers: {config.workers}")

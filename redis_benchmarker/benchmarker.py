@@ -253,6 +253,7 @@ class RedisBenchmarker:
                 "socket_timeout": self.config.redis.socket_timeout,
                 "socket_connect_timeout": self.config.redis.socket_connect_timeout,
                 "max_connections": self.config.max_connections,
+                "protocol": self.config.redis.protocol,
             }
 
             if self.config.redis.password:
