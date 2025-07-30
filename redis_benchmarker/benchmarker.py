@@ -497,43 +497,58 @@ class RedisBenchmarker:
         counters: ThreadSafeCounters
     ) -> None:
         """
-        Run QPS-controlled benchmark with global rate limiting across all workers.
+        Run QPS-controlled benchmark with intelligent batch submission.
 
-        The QPS limiting is enforced on completion rate, not submission rate,
-        ensuring the target QPS is respected across all worker threads.
+        The QPS limiting is enforced by submitting queries in calculated batches at timed intervals,
+        ensuring the target QPS is respected while maintaining worker utilization and connection
+        pool efficiency.
         """
 
-        # Submit all futures immediately - QPS limiting happens during processing
+        # Calculate optimal batch submission strategy
+        target_qps = qps_controller.target_qps
+        max_workers = self.config.workers
+
+        # Determine batch size and interval based on QPS and worker count
+        if target_qps >= max_workers:
+            # High QPS: Submit batches frequently to maintain rate
+            batch_size = max(1, min(max_workers, int(target_qps / 10)))  # 10 batches per second
+            batch_interval = batch_size / target_qps
+        else:
+            # Low QPS: Submit smaller batches less frequently
+            batch_size = 1
+            batch_interval = 1.0 / target_qps
+
+        # Submit queries in controlled batches
         all_futures = []
-        for _ in range(total_requests):
-            future = thread_executor.submit(self._execute_single_query, executor, connection_pool)
-            all_futures.append(future)
+        remaining_requests = total_requests
+        next_batch_time = time.time()
 
-        # Process results with QPS rate limiting
-        processed = 0
-        start_time = time.time()
-        last_completion_time = start_time
-
-        for future in as_completed(all_futures):
-            # Apply QPS limiting before processing each result
+        while remaining_requests > 0:
+            # Wait until it's time for the next batch
             current_time = time.time()
-            time_since_last = current_time - last_completion_time
-
-            # Calculate minimum time between completions for target QPS
-            min_interval = 1.0 / qps_controller.target_qps
-
-            if time_since_last < min_interval:
-                sleep_time = min_interval - time_since_last
+            if current_time < next_batch_time:
+                sleep_time = next_batch_time - current_time
                 time.sleep(sleep_time)
-                last_completion_time = time.time()
-            else:
-                last_completion_time = current_time
 
-            # Process the completed future
-            processed += 1
+            # Calculate current batch size (might be smaller for last batch)
+            current_batch_size = min(batch_size, remaining_requests)
 
+            # Submit the batch of queries
+            batch_futures = []
+            for _ in range(current_batch_size):
+                future = thread_executor.submit(self._execute_single_query, executor, connection_pool)
+                batch_futures.append(future)
+                all_futures.append(future)
+
+            remaining_requests -= current_batch_size
+
+            # Calculate next batch time
+            next_batch_time = time.time() + batch_interval
+
+        # Process all results as they complete (preserving connection pool efficiency)
+        for future in as_completed(all_futures):
             try:
-                query_result = future.result()
+                query_result = future.result(timeout=self.config.timeout)
                 qps_controller.record_completion()
 
                 if "error" in query_result:
@@ -561,7 +576,7 @@ class RedisBenchmarker:
     class QpsController:
         """
         QPS controller for tracking completion statistics.
-        Rate limiting is now handled directly in the processing loop.
+        Rate limiting is handled by controlling query submission timing.
         """
 
         def __init__(self, target_qps: float):
