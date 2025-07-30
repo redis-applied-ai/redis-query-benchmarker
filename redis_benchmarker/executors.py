@@ -9,6 +9,7 @@ import numpy as np
 import sys
 import inspect
 import atexit
+import gzip
 from redisvl.index import SearchIndex
 from redisvl.query import VectorQuery, FilterQuery
 from redis.commands.search.query import Query
@@ -116,6 +117,8 @@ class BaseQueryExecutor(ABC, metaclass=AutoMainMeta):
         self._vector_pool: List[np.ndarray] = []
         self._vector_pool_index = 0
         self._vector_pool_size = 1000  # Default pool size
+        self._sample_query_pool: List[str] = []
+        self._sample_query_pool_index = 0
 
     @abstractmethod
     def execute_query(self, redis_client: redis.Redis) -> Dict[str, Any]:
@@ -135,22 +138,90 @@ class BaseQueryExecutor(ABC, metaclass=AutoMainMeta):
 
     def prepare(self, redis_client: redis.Redis) -> None:
         """Optional preparation step before benchmarking starts."""
-        # Pre-generate vector pool for performance
-        self._initialize_vector_pool()
+        if self.config.sample_file:
+            # Load sample queries from file instead of initializing vector pool
+            self._load_sample_queries()
+        else:
+            # Pre-generate vector pool for performance
+            self._initialize_vector_pool()
 
     def _initialize_vector_pool(self) -> None:
         """Initialize the vector pool with pre-generated vectors."""
         if not self._vector_pool:  # Only initialize if empty
-            # Reduce vector pool size for large benchmarks to save memory
-            if self.config.total_requests >= 100000:
-                self._vector_pool_size = min(100, self._vector_pool_size)  # Much smaller pool
-                
             print(f"Pre-generating {self._vector_pool_size} vectors of dimension {self.config.vector_dim} for performance...")
             self._vector_pool = []
             for _ in range(self._vector_pool_size):
                 vector = self.make_single_vector()
                 self._vector_pool.append(vector)
             print(f"Vector pool initialized with {len(self._vector_pool)} vectors")
+
+    def _load_sample_queries(self) -> None:
+        """Load sample queries from the specified file."""
+        if not self.config.sample_file:
+            raise ValueError("No sample file specified")
+
+        try:
+            # Check if file is gzip compressed
+            is_gzipped = self.config.sample_file.endswith('.gz')
+
+            if is_gzipped:
+                with gzip.open(self.config.sample_file, 'rt', encoding='utf-8') as f:
+                    lines = f.readlines()
+            else:
+                with open(self.config.sample_file, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+
+            # Filter out empty lines and strip whitespace
+            self._sample_query_pool = [line.strip() for line in lines if line.strip()]
+
+            if not self._sample_query_pool:
+                raise ValueError(f"No valid queries found in sample file: {self.config.sample_file}")
+
+            file_type = "compressed " if is_gzipped else ""
+            print(f"Loaded {len(self._sample_query_pool)} sample queries from {file_type}file {self.config.sample_file}")
+
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Sample file not found: {self.config.sample_file}")
+        except Exception as e:
+            raise RuntimeError(f"Error loading sample file {self.config.sample_file}: {e}")
+
+    def get_query_from_pool(self) -> str:
+        """
+        Get a pre-loaded query from the sample query pool.
+
+        This method is thread-safe and cycles through the pool.
+
+        Returns:
+            str: A query string from the sample query pool
+
+        Raises:
+            RuntimeError: If the sample query pool has not been loaded
+        """
+        if not self._sample_query_pool:
+            raise RuntimeError("Sample query pool has not been loaded. Use --sample-file option or call _load_sample_queries() first.")
+
+        # Use modulo to cycle through the pool (thread-safe for reads)
+        query = self._sample_query_pool[self._sample_query_pool_index % len(self._sample_query_pool)]
+        self._sample_query_pool_index = (self._sample_query_pool_index + 1) % len(self._sample_query_pool)
+        return query
+
+    def set_sample_query_pool(self, queries: List[str]) -> None:
+        """
+        Set the sample query pool directly with a list of queries.
+
+        Args:
+            queries: List of query strings
+
+        Raises:
+            ValueError: If queries list is empty
+        """
+        if not queries:
+            raise ValueError("Queries list cannot be empty")
+        self._sample_query_pool = [q.strip() for q in queries if q.strip()]
+        if not self._sample_query_pool:
+            raise ValueError("No valid queries provided (all were empty or whitespace)")
+        self._sample_query_pool_index = 0
+        print(f"Sample query pool set with {len(self._sample_query_pool)} queries")
 
     def make_single_vector(self) -> np.ndarray:
         """
@@ -196,9 +267,7 @@ class BaseQueryExecutor(ABC, metaclass=AutoMainMeta):
 
     def cleanup(self, redis_client: redis.Redis) -> None:
         """Optional cleanup step after benchmarking ends."""
-        # Clear vector pool to free memory
-        self._vector_pool.clear()
-        self._vector_pool_index = 0
+        pass
 
     @classmethod
     def get_executor_name(cls) -> str:
@@ -233,12 +302,6 @@ class VectorSearchExecutor(BaseQueryExecutor):
         super().__init__(config)
         self.index: Optional[SearchIndex] = None
         self.vector_field = config.vector_field or "embedding"
-        
-    def cleanup(self, redis_client: redis.Redis) -> None:
-        """Cleanup resources and clear index reference."""
-        super().cleanup(redis_client)
-        # Clear index reference to free memory
-        self.index = None
 
     def prepare(self, redis_client: redis.Redis) -> None:
         """Initialize the search index."""
@@ -289,12 +352,6 @@ class HybridSearchExecutor(BaseQueryExecutor):
             "filter_expression",
             "@price:[0 75]"
         )
-        
-    def cleanup(self, redis_client: redis.Redis) -> None:
-        """Cleanup resources and clear index reference."""
-        super().cleanup(redis_client)
-        # Clear index reference to free memory
-        self.index = None
 
     def prepare(self, redis_client: redis.Redis) -> None:
         if self.config.index_name:
