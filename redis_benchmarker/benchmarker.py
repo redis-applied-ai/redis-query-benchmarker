@@ -522,18 +522,16 @@ class RedisBenchmarker:
         """
 
         # Calculate optimal batch submission strategy
-        target_qps = qps_controller.target_qps
+        initial_target_qps = qps_controller.get_current_target_qps() if hasattr(qps_controller, 'get_current_target_qps') else qps_controller.target_qps
         max_workers = self.config.workers
 
-        # Determine batch size and interval based on QPS and worker count
-        if target_qps >= max_workers:
+        # Determine initial batch size and interval based on QPS and worker count
+        if initial_target_qps >= max_workers:
             # High QPS: Submit batches frequently to maintain rate
-            batch_size = max(1, min(max_workers, int(target_qps / 10)))  # 10 batches per second
-            batch_interval = batch_size / target_qps
+            base_batch_size = max(1, min(max_workers, int(initial_target_qps / 10)))  # 10 batches per second
         else:
             # Low QPS: Submit smaller batches less frequently
-            batch_size = 1
-            batch_interval = 1.0 / target_qps
+            base_batch_size = 1
 
         # Process queries with controlled submission and concurrent result processing
         all_futures = []
@@ -594,6 +592,17 @@ class RedisBenchmarker:
 
         # Submit queries in controlled batches while results are processed concurrently
         while remaining_requests > 0:
+            # Get current target QPS (may have changed due to jitter)
+            current_target_qps = qps_controller.get_current_target_qps() if hasattr(qps_controller, 'get_current_target_qps') else qps_controller.target_qps
+            
+            # Recalculate batch size and interval based on current target QPS
+            if current_target_qps >= max_workers:
+                batch_size = max(1, min(max_workers, int(current_target_qps / 10)))
+                batch_interval = batch_size / current_target_qps
+            else:
+                batch_size = 1
+                batch_interval = 1.0 / current_target_qps
+            
             # Wait until it's time for the next batch
             current_time = time.time()
             if current_time < next_batch_time:
@@ -617,6 +626,109 @@ class RedisBenchmarker:
 
         # Wait for all results to be processed
         processing_complete.wait()
+
+    class JitteredQpsController:
+        """
+        QPS controller with jitter support for realistic traffic simulation.
+        Periodically recalculates target QPS based on configured jitter parameters.
+        """
+
+        def __init__(self, base_qps: float, jitter_percent: float, jitter_interval: float, distribution: str = "uniform"):
+            self.base_qps = base_qps
+            self.jitter_percent = jitter_percent
+            self.jitter_interval = jitter_interval
+            self.distribution = distribution
+            
+            self.current_target_qps = base_qps
+            self.last_jitter_update = time.time()
+            self.start_time = time.time()
+            self.completed_count = 0
+            self.lock = threading.Lock()
+            
+            # Keep track of completion times for statistics
+            self.completed_times = deque(maxlen=50)
+            
+            # Initialize first jitter value
+            self._recalculate_jitter()
+
+        def _recalculate_jitter(self):
+            """Recalculate target QPS based on jitter distribution."""
+            jitter_factor = self.jitter_percent / 100.0
+            
+            if self.distribution == "uniform":
+                # Uniform distribution: ±jitter_percent with equal probability
+                jitter_multiplier = 1.0 + random.uniform(-jitter_factor, jitter_factor)
+            
+            elif self.distribution == "normal":
+                # Normal distribution: centered on base_qps with std_dev = jitter_percent/3
+                std_dev = jitter_factor / 3.0  # 99.7% of values within ±jitter_percent
+                jitter_multiplier = 1.0 + random.gauss(0, std_dev)
+                # Clamp to reasonable bounds
+                jitter_multiplier = max(1.0 - jitter_factor, min(1.0 + jitter_factor, jitter_multiplier))
+            
+            elif self.distribution == "triangular":
+                # Triangular distribution: more likely to be near base_qps
+                jitter_multiplier = 1.0 + random.triangular(-jitter_factor, jitter_factor, 0)
+            
+            elif self.distribution == "bursty":
+                # Bursty distribution: 80% normal traffic, 20% spikes
+                if random.random() < 0.8:
+                    # Normal traffic: slight variation
+                    jitter_multiplier = 1.0 + random.uniform(-jitter_factor * 0.3, jitter_factor * 0.3)
+                else:
+                    # Traffic spike: significant increase
+                    jitter_multiplier = 1.0 + random.uniform(jitter_factor * 0.5, jitter_factor)
+            
+            else:
+                # Fallback to uniform
+                jitter_multiplier = 1.0 + random.uniform(-jitter_factor, jitter_factor)
+            
+            # Ensure we don't go below zero or negative QPS
+            jitter_multiplier = max(0.1, jitter_multiplier)
+            
+            self.current_target_qps = self.base_qps * jitter_multiplier
+            self.last_jitter_update = time.time()
+
+        def get_current_target_qps(self) -> float:
+            """Get the current target QPS, recalculating jitter if needed."""
+            current_time = time.time()
+            if current_time - self.last_jitter_update >= self.jitter_interval:
+                self._recalculate_jitter()
+            return self.current_target_qps
+
+        def record_completion(self):
+            """Record that a query was completed."""
+            with self.lock:
+                self.completed_count += 1
+                self.completed_times.append(time.time())
+
+        def _calculate_actual_qps(self) -> float:
+            """Calculate actual QPS based on recent completions."""
+            if len(self.completed_times) < 2:
+                return 0.0
+
+            time_span = self.completed_times[-1] - self.completed_times[0]
+            if time_span <= 0:
+                return 0.0
+
+            return (len(self.completed_times) - 1) / time_span
+
+        def get_stats(self) -> Dict[str, float]:
+            """Get current controller statistics."""
+            with self.lock:
+                elapsed = time.time() - self.start_time
+                completed_qps = self.completed_count / elapsed if elapsed > 0 else 0
+                actual_qps = self._calculate_actual_qps()
+
+                return {
+                    "base_qps": self.base_qps,
+                    "current_target_qps": self.current_target_qps,
+                    "completed_qps": completed_qps,
+                    "actual_qps": actual_qps,
+                    "completed_count": self.completed_count,
+                    "jitter_percent": self.jitter_percent,
+                    "jitter_distribution": self.distribution
+                }
 
     class QpsController:
         """
@@ -796,7 +908,19 @@ class RedisBenchmarker:
                         all_futures = []
 
                         # Initialize QPS controller if QPS limiting is enabled
-                        qps_controller = self.QpsController(self.config.qps) if self.config.qps else None
+                        qps_controller = None
+                        if self.config.qps:
+                            if self.config.jitter_enabled:
+                                qps_controller = self.JitteredQpsController(
+                                    self.config.qps,
+                                    self.config.jitter_percent,
+                                    self.config.jitter_interval_secs,
+                                    self.config.jitter_distribution
+                                )
+                                if self.config.verbose:
+                                    self.console.print(f"[cyan]Using jittered QPS controller: {self.config.qps}±{self.config.jitter_percent}% ({self.config.jitter_distribution} distribution)[/cyan]")
+                            else:
+                                qps_controller = self.QpsController(self.config.qps)
 
                         # Process queries efficiently with proper threading
                         if qps_controller:
@@ -903,7 +1027,16 @@ class RedisBenchmarker:
         if qps_controller and self.config.verbose:
             stats = qps_controller.get_stats()
             self.console.print(f"\n[cyan]QPS Controller Stats:[/cyan]")
-            self.console.print(f"  Target QPS: {stats['target_qps']:.2f}")
+            
+            if 'base_qps' in stats:
+                # Jittered controller stats
+                self.console.print(f"  Base QPS: {stats['base_qps']:.2f}")
+                self.console.print(f"  Current Target QPS: {stats['current_target_qps']:.2f}")
+                self.console.print(f"  Jitter: ±{stats['jitter_percent']:.1f}% ({stats['jitter_distribution']})")
+            else:
+                # Regular controller stats
+                self.console.print(f"  Target QPS: {stats['target_qps']:.2f}")
+            
             self.console.print(f"  Actual QPS: {stats['actual_qps']:.2f}")
             self.console.print(f"  Completed QPS: {stats['completed_qps']:.2f}")
             self.console.print(f"  Total Completed: {stats['completed_count']}")

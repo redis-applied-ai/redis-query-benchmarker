@@ -43,6 +43,12 @@ from .executors import list_query_executors
 @click.option('--sample-file', default=None, help='File path containing sample queries (one per line)')
 @click.option('--resp', default=2, type=click.IntRange(2, 3), help='Redis protocol version (2 or 3)')
 @click.option('--pre-warm', default=0, type=int, help='Number of connections to pre-warm in the pool (0 = disabled)')
+@click.option('--jitter-enabled', is_flag=True, help='Enable QPS jitter for realistic traffic simulation')
+@click.option('--jitter-percent', default=10.0, type=float, help='QPS jitter percentage (±)', show_default=True)
+@click.option('--jitter-interval-secs', default=5.0, type=float, help='Jitter recalculation interval in seconds', show_default=True)
+@click.option('--jitter-distribution', default='uniform', 
+              type=click.Choice(['uniform', 'normal', 'triangular', 'bursty']),
+              help='Jitter distribution type', show_default=True)
 def main(**kwargs):
     """Redis Query Benchmarker - Benchmark Redis search queries with configurable executors."""
 
@@ -90,6 +96,10 @@ def main(**kwargs):
                 qps=kwargs['qps'],
                 sample_file=kwargs['sample_file'],
                 pre_warm_connections=kwargs['pre_warm'],
+                jitter_enabled=kwargs['jitter_enabled'],
+                jitter_percent=kwargs['jitter_percent'],
+                jitter_interval_secs=kwargs['jitter_interval_secs'],
+                jitter_distribution=kwargs['jitter_distribution'],
                 extra_params=extra_params
             )
 
@@ -118,6 +128,8 @@ def main(**kwargs):
         click.echo(f"Requests: {config.total_requests}")
         click.echo(f"Workers: {config.workers}")
         click.echo(f"QPS: {config.qps}")
+        if config.qps and config.jitter_enabled:
+            click.echo(f"Jitter: ±{config.jitter_percent}% ({config.jitter_distribution}, {config.jitter_interval_secs}s intervals)")
         if config.index_name:
             click.echo(f"Index: {config.index_name}")
         if config.sample_file:

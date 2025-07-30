@@ -51,6 +51,12 @@ class BenchmarkConfig(BaseModel):
     pre_warm_connections: int = Field(default=0, description="Number of connections to pre-warm in the pool", ge=0)
     extra_params: Dict[str, Any] = Field(default_factory=dict, description="Extra parameters")
 
+    # QPS Jitter settings
+    jitter_enabled: bool = Field(default=False, description="Enable QPS jitter for realistic traffic simulation")
+    jitter_percent: float = Field(default=10.0, description="QPS jitter percentage (±)", ge=0, le=100)
+    jitter_interval_secs: float = Field(default=5.0, description="Jitter recalculation interval in seconds", ge=0.1)
+    jitter_distribution: str = Field(default="uniform", description="Jitter distribution type (uniform, normal, triangular, bursty)")
+
     @field_validator('workers')
     @classmethod
     def validate_workers(cls, v):
@@ -63,6 +69,20 @@ class BenchmarkConfig(BaseModel):
     def validate_output_format(cls, v):
         if v not in ['console', 'json', 'csv']:
             raise ValueError('Output format must be console, json, or csv')
+        return v
+
+    @field_validator('jitter_distribution')
+    @classmethod
+    def validate_jitter_distribution(cls, v):
+        if v not in ['uniform', 'normal', 'triangular', 'bursty']:
+            raise ValueError('Jitter distribution must be uniform, normal, triangular, or bursty')
+        return v
+
+    @field_validator('jitter_enabled')
+    @classmethod
+    def validate_jitter_enabled(cls, v, values):
+        if v and not values.data.get('qps'):
+            raise ValueError('QPS jitter requires qps to be set')
         return v
 
     @property
