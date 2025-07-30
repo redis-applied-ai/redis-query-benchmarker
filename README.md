@@ -196,6 +196,57 @@ cd redis-query-benchmarker
 python examples/ultra_simple_executor.py --total-requests 500
 ```
 
+## Usage
+
+### Basic Example
+
+```bash
+# ... existing examples ...
+
+### Using Sample Queries
+
+You can now load queries from a file instead of generating them dynamically:
+
+```bash
+# Create a sample queries file
+echo "@category:electronics @price:[10 50]
+@title:laptop @brand:apple
+@category:books @author:tolkien" > my_queries.txt
+
+# Use the sample file in your benchmark
+python -m redis_benchmarker \
+    --sample-file my_queries.txt \
+    --query-type redis_py \
+    --index-name my_index \
+    --total-requests 1000 \
+    --workers 16
+```
+
+The `--sample-file` option:
+- Loads queries from a text file (one query per line)
+- Supports gzip-compressed files (auto-detected by `.gz` extension)
+- Cycles through the queries during the benchmark
+- Skips vector pool initialization when used
+- Works with any custom executor that calls `get_query_from_pool()`
+
+### Custom Executors with Sample Queries
+
+```python
+class MyCustomExecutor(BaseQueryExecutor):
+    def execute_query(self, redis_client):
+        # Get a pre-loaded query from the sample pool
+        query_text = self.get_query_from_pool()
+
+        # Use the query in your search
+        result = redis_client.ft("my_index").search(query_text)
+
+        return {
+            "result": result,
+            "latency_ms": latency,
+            "metadata": {"query": query_text}
+        }
+```
+
 ## When to Check Out This Repository
 
 You only need to clone this repository if you want to:

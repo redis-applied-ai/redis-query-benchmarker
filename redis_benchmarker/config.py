@@ -17,6 +17,7 @@ class RedisConnectionConfig(BaseModel):
     socket_timeout: float = Field(default=30.0, description="Socket timeout in seconds")
     socket_connect_timeout: float = Field(default=30.0, description="Socket connect timeout")
     max_connections: Optional[int] = Field(default=None, description="Max connections in pool")
+    protocol: int = Field(default=2, description="Redis protocol version (2 or 3)", ge=2, le=3)
 
 
 class BenchmarkConfig(BaseModel):
@@ -46,6 +47,7 @@ class BenchmarkConfig(BaseModel):
     warmup_requests: int = Field(default=0, description="Number of warmup requests", ge=0)
     timeout: float = Field(default=30.0, description="Query timeout in seconds")
     qps: Optional[float] = Field(default=None, description="Target queries per second (QPS)")
+    sample_file: Optional[str] = Field(default=None, description="File path containing sample queries (one per line)")
     extra_params: Dict[str, Any] = Field(default_factory=dict, description="Extra parameters")
 
     @field_validator('workers')

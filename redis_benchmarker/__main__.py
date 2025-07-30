@@ -40,6 +40,8 @@ from .executors import list_query_executors
 @click.option('--search-query', default='*', help='Search query for redis-py search')
 @click.option('--max-connections', default=None, type=int, help='Max connections in pool')
 @click.option('--qps', default=None, type=float, help='Target queries per second (QPS)')
+@click.option('--sample-file', default=None, help='File path containing sample queries (one per line)')
+@click.option('--resp', default=2, type=click.IntRange(2, 3), help='Redis protocol version (2 or 3)')
 def main(**kwargs):
     """Redis Query Benchmarker - Benchmark Redis search queries with configurable executors."""
 
@@ -58,7 +60,8 @@ def main(**kwargs):
                 db=kwargs['db'],
                 tls=kwargs['tls'],
                 tls_insecure=kwargs['insecure'],
-                max_connections=kwargs['max_connections']
+                max_connections=kwargs['max_connections'],
+                protocol=kwargs['resp']
             )
 
             # Build extra params for different query types
@@ -84,6 +87,7 @@ def main(**kwargs):
                 verbose=kwargs['verbose'],
                 show_expanded_metrics=kwargs['show_expanded_metrics'],
                 qps=kwargs['qps'],
+                sample_file=kwargs['sample_file'],
                 extra_params=extra_params
             )
 
@@ -98,16 +102,24 @@ def main(**kwargs):
             click.echo("Error: --index-name is required for vector and hybrid search queries", err=True)
             sys.exit(1)
 
+        # Validate sample file if provided
+        if config.sample_file and not os.path.isfile(config.sample_file):
+            click.echo(f"Error: Sample file not found: {config.sample_file}", err=True)
+            sys.exit(1)
+
         # Run benchmark
         click.echo("Redis Query Benchmarker")
         click.echo("=" * 40)
         click.echo(f"Target: {config.redis.host}:{config.redis.port}")
+        click.echo(f"Protocol: RESP{config.redis.protocol}")
         click.echo(f"Query Type: {config.query_type}")
         click.echo(f"Requests: {config.total_requests}")
         click.echo(f"Workers: {config.workers}")
         click.echo(f"QPS: {config.qps}")
         if config.index_name:
             click.echo(f"Index: {config.index_name}")
+        if config.sample_file:
+            click.echo(f"Sample File: {config.sample_file}")
         click.echo()
 
         benchmarker = RedisBenchmarker(config)

@@ -307,8 +307,9 @@ class RedisDataGenerator:
 @click.option('--create-index', is_flag=True, help='Create the search index')
 @click.option('--force', is_flag=True, help='Force overwrite existing index')
 @click.option('--workers', default=4, help='Number of worker threads')
+@click.option('--resp', default=2, type=click.IntRange(2, 3), help='Redis protocol version (2 or 3)')
 def main(host, port, password, db, documents, document_type, vector_dim,
-         index_name, vector_field, batch_size, create_index, force, workers):
+         index_name, vector_field, batch_size, create_index, force, workers, resp):
     """Generate sample data for Redis benchmarking."""
 
     # Connect to Redis
@@ -317,7 +318,8 @@ def main(host, port, password, db, documents, document_type, vector_dim,
         port=port,
         password=password,
         db=db,
-        decode_responses=False
+        decode_responses=False,
+        protocol=resp
     )
 
     try:
