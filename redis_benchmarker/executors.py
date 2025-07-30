@@ -10,6 +10,8 @@ import sys
 import inspect
 import atexit
 import gzip
+import codecs
+import shlex
 from redisvl.index import SearchIndex
 from redisvl.query import VectorQuery, FilterQuery
 from redis.commands.search.query import Query
@@ -155,6 +157,48 @@ class BaseQueryExecutor(ABC, metaclass=AutoMainMeta):
                 self._vector_pool.append(vector)
             print(f"Vector pool initialized with {len(self._vector_pool)} vectors")
 
+    def _decode_vector_data_in_query(self, cmd_args):
+        """
+        Convert hex-encoded vector data (Redis Insights format) to bytes for redis-py.
+
+        Args:
+            cmd_args: List of command arguments that may contain hex-encoded vector data
+
+        Returns:
+            List: Updated command arguments with properly converted vector data
+        """
+        # print("cmd_args: " + str(cmd_args))
+        if 'vector' in cmd_args:
+            vector_idx = cmd_args.index('vector')
+            if vector_idx + 1 < len(cmd_args):
+                vector_data = cmd_args[vector_idx + 1]
+                try:
+                    byte_data = codecs.decode(vector_data, 'unicode_escape')
+                except UnicodeDecodeError as e:
+                    if 'invalid escape sequence' in str(e):
+                        byte_data = vector_data.encode('latin1')
+                        if len(byte_data) < 256:
+                            byte_data = byte_data.ljust(256, b'a')
+                    else:
+                        return None
+                byte_data = byte_data.encode('latin1')
+
+                if len(byte_data) < 256:
+                    byte_data = byte_data.ljust(256, b'a')
+
+                cmd_args[vector_idx + 1] = byte_data
+
+        return cmd_args
+
+    def _process_line(self, line: str):
+        try:
+            cmd_args = shlex.split(line)
+            cmd_args = self._decode_vector_data_in_query(cmd_args)
+            return cmd_args
+        except ValueError:
+            return None
+
+
     def _load_sample_queries(self) -> None:
         """Load sample queries from the specified file."""
         if not self.config.sample_file:
@@ -172,7 +216,14 @@ class BaseQueryExecutor(ABC, metaclass=AutoMainMeta):
                     lines = f.readlines()
 
             # Filter out empty lines and strip whitespace
-            self._sample_query_pool = [line.strip() for line in lines if line.strip()]
+            self._sample_query_pool = [self._process_line(line.strip()) for line in lines if line.strip()]
+            # Filter out any None objects from the sample query pool
+            initial_count = len(self._sample_query_pool)
+            self._sample_query_pool = [query for query in self._sample_query_pool if query is not None]
+            filtered_count = initial_count - len(self._sample_query_pool)
+
+            if filtered_count > 0:
+                print(f"Warning: Filtered out {filtered_count} queries due to errors parsing errors.")
 
             if not self._sample_query_pool:
                 raise ValueError(f"No valid queries found in sample file: {self.config.sample_file}")
@@ -183,6 +234,8 @@ class BaseQueryExecutor(ABC, metaclass=AutoMainMeta):
         except FileNotFoundError:
             raise FileNotFoundError(f"Sample file not found: {self.config.sample_file}")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             raise RuntimeError(f"Error loading sample file {self.config.sample_file}: {e}")
 
     def get_query_from_pool(self) -> str:
@@ -222,6 +275,15 @@ class BaseQueryExecutor(ABC, metaclass=AutoMainMeta):
             raise ValueError("No valid queries provided (all were empty or whitespace)")
         self._sample_query_pool_index = 0
         print(f"Sample query pool set with {len(self._sample_query_pool)} queries")
+
+    def sample_is_available(self) -> bool:
+        """
+        Check if sample queries are available in the pool.
+
+        Returns:
+            bool: True if sample query pool is not empty, False otherwise
+        """
+        return bool(self._sample_query_pool)
 
     def make_single_vector(self) -> np.ndarray:
         """
