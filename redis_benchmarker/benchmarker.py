@@ -3,6 +3,7 @@
 import time
 import json
 import csv
+import sys
 import threading
 import queue
 from collections import deque
@@ -242,6 +243,7 @@ class RedisBenchmarker:
     def __init__(self, config: BenchmarkConfig):
         self.config = config
         self.console = Console()
+        self.is_interactive = sys.stdout.isatty()
         self._connection_pool: Optional[redis.ConnectionPool] = None
 
     def _create_connection_pool(self) -> redis.ConnectionPool:
@@ -450,19 +452,29 @@ class RedisBenchmarker:
                     snapshot['total_result_count']
                 )
 
-                # Update progress bar
-                update_fields = {
-                    "avg_latency": metrics["avg_latency"],
-                    "current_qps": metrics["current_qps"]
-                }
+                if self.is_interactive:
+                    # Update progress bar for interactive terminals
+                    update_fields = {
+                        "avg_latency": metrics["avg_latency"],
+                        "current_qps": metrics["current_qps"]
+                    }
 
-                if self.config.show_expanded_metrics:
-                    update_fields.update({
-                        "avg_results": metrics["avg_results"],
-                        "norm_latency": metrics["norm_latency"]
-                    })
+                    if self.config.show_expanded_metrics:
+                        update_fields.update({
+                            "avg_results": metrics["avg_results"],
+                            "norm_latency": metrics["norm_latency"]
+                        })
 
-                progress.update(task, completed=snapshot['completed_count'], **update_fields)
+                    progress.update(task, completed=snapshot['completed_count'], **update_fields)
+                else:
+                    # Print status messages for non-interactive terminals
+                    percentage = (snapshot['completed_count'] / self.config.total_requests) * 100
+                    status_msg = f"Progress: {snapshot['completed_count']}/{self.config.total_requests} ({percentage:.1f}%) | Avg Latency: {metrics['avg_latency']:.1f}ms | QPS: {metrics['current_qps']:.1f}"
+
+                    if self.config.show_expanded_metrics:
+                        status_msg += f" | Avg Results: {metrics['avg_results']:.1f} | Norm Latency: {metrics['norm_latency']:.2f}ms/result"
+
+                    print(status_msg, flush=True)
 
                 # Adaptive update frequency
                 stop_event.wait(update_interval)
@@ -676,10 +688,18 @@ class RedisBenchmarker:
         # Create connection pool once for all workers
         connection_pool = self._create_connection_pool()
 
+        # For non-interactive terminals, disable progress bar display
+        progress_kwargs = {
+            "console": self.console,
+            "expand": True
+        }
+        if not self.is_interactive:
+            progress_kwargs["disable"] = True
+            print("Starting benchmark progress tracking...", flush=True)
+
         with Progress(
                 *progress_columns,
-                console=self.console,
-                expand=True
+                **progress_kwargs
             ) as progress:
                 task_fields = {
                     "avg_latency": 0.0,
