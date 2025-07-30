@@ -485,165 +485,81 @@ class RedisBenchmarker:
         counters: ThreadSafeCounters
     ) -> None:
         """
-        Run QPS-controlled benchmark with efficient threading and minimal overhead.
+        Run QPS-controlled benchmark with global rate limiting across all workers.
 
-        Uses a producer thread for controlled submission and consumer processing
-        for results to maintain high performance while respecting QPS limits.
+        The QPS limiting is enforced on completion rate, not submission rate,
+        ensuring the target QPS is respected across all worker threads.
         """
 
-        # Queue for passing futures from producer to consumer
-        future_queue = queue.Queue(maxsize=self.config.workers * 2)
-        submission_complete = threading.Event()
+        # Submit all futures immediately - QPS limiting happens during processing
+        all_futures = []
+        for _ in range(total_requests):
+            future = thread_executor.submit(self._execute_single_query, executor, connection_pool)
+            all_futures.append(future)
 
-        def submission_producer():
-            """Producer thread that submits queries at controlled rate."""
-            submitted = 0
-            while submitted < total_requests:
-                # Apply QPS limiting
-                sleep_time = qps_controller.should_submit_next()
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-
-                # Submit query and record submission
-                future = thread_executor.submit(self._execute_single_query, executor, connection_pool)
-                qps_controller.record_submission()
-
-                # Add to queue for processing
-                future_queue.put(future)
-                submitted += 1
-
-            # Signal completion
-            submission_complete.set()
-
-        # Start submission producer thread
-        producer_thread = threading.Thread(target=submission_producer, daemon=True)
-        producer_thread.start()
-
-        # Process results as they complete (main thread)
+        # Process results with QPS rate limiting
         processed = 0
-        active_futures = set()
+        start_time = time.time()
+        last_completion_time = start_time
 
-        while processed < total_requests:
-            # Collect new futures from producer (non-blocking)
+        for future in as_completed(all_futures):
+            # Apply QPS limiting before processing each result
+            current_time = time.time()
+            time_since_last = current_time - last_completion_time
+
+            # Calculate minimum time between completions for target QPS
+            min_interval = 1.0 / qps_controller.target_qps
+
+            if time_since_last < min_interval:
+                sleep_time = min_interval - time_since_last
+                time.sleep(sleep_time)
+                last_completion_time = time.time()
+            else:
+                last_completion_time = current_time
+
+            # Process the completed future
+            processed += 1
+
             try:
-                while len(active_futures) < self.config.workers * 2:
-                    future = future_queue.get_nowait()
-                    active_futures.add(future)
-            except queue.Empty:
-                pass
+                query_result = future.result()
+                qps_controller.record_completion()
 
-            # Process completed futures efficiently
-            if active_futures:
-                # Use as_completed with short timeout for responsiveness
-                try:
-                    for future in as_completed(active_futures, timeout=0.1):
-                        active_futures.remove(future)
-                        processed += 1
+                if "error" in query_result:
+                    errors.append(query_result["error"])
+                    counters.update_error()
+                else:
+                    # Update incremental statistics
+                    latency_ms = query_result["latency_ms"]
+                    latency_stats_calc.add_value(latency_ms)
 
-                        try:
-                            query_result = future.result()
+                    # Keep samples for export
+                    latencies_sample.append(latency_ms)
 
-                            # Record completion for QPS controller (batch updates for efficiency)
-                            if processed % 10 == 0:  # Update every 10 completions to reduce locking
-                                for _ in range(min(10, processed)):
-                                    qps_controller.record_completion()
+                    # Extract result count from metadata
+                    result_count = self._extract_result_count(query_result)
+                    result_counts_sample.append(result_count)
 
-                            if "error" in query_result:
-                                errors.append(query_result["error"])
-                                counters.update_error()
-                            else:
-                                # Update incremental statistics
-                                latency_ms = query_result["latency_ms"]
-                                latency_stats_calc.add_value(latency_ms)
+                    # Update thread-safe counters
+                    counters.update_success(latency_ms, result_count)
 
-                                # Keep samples for export
-                                latencies_sample.append(latency_ms)
-
-                                # Extract result count from metadata
-                                result_count = self._extract_result_count(query_result)
-                                result_counts_sample.append(result_count)
-
-                                # Update thread-safe counters
-                                counters.update_success(latency_ms, result_count)
-
-                        except Exception as e:
-                            errors.append(str(e))
-                            counters.update_error()
-
-                        # Break after processing one to check for new submissions
-                        break
-
-                except:
-                    # Timeout or other exception - continue processing
-                    pass
-
-            # If no active futures and submission is complete, get any remaining from queue
-            if not active_futures and submission_complete.is_set():
-                try:
-                    future = future_queue.get_nowait()
-                    active_futures.add(future)
-                except queue.Empty:
-                    break
-
-        # Ensure all QPS controller completions are recorded
-        remaining_completions = processed - (processed // 10) * 10
-        for _ in range(remaining_completions):
-            qps_controller.record_completion()
-
-        # Wait for producer thread to finish
-        producer_thread.join(timeout=1.0)
+            except Exception as e:
+                errors.append(str(e))
+                counters.update_error()
 
     class QpsController:
         """
-        Feedback-controlled QPS limiter that adjusts submission timing based on actual measured QPS.
+        QPS controller for tracking completion statistics.
+        Rate limiting is now handled directly in the processing loop.
         """
 
         def __init__(self, target_qps: float):
             self.target_qps = target_qps
             self.start_time = time.time()
-            self.submitted_count = 0
             self.completed_count = 0
-            self.last_submission_time = 0
-            self.submission_interval = 1.0 / target_qps  # Target time between submissions
             self.lock = threading.Lock()
 
-            # Feedback control parameters
-            self.feedback_window = 50  # Number of completed queries to consider for feedback
-            self.completed_times = deque(maxlen=self.feedback_window)
-            self.adjustment_factor = 0.1  # How aggressively to adjust (10%)
-            self.min_interval = 0.001  # Minimum interval between submissions (1ms)
-
-        def should_submit_next(self) -> float:
-            """
-            Determine if we should submit the next query and how long to wait.
-
-            Returns:
-                float: Time to sleep before submitting (0 means submit immediately)
-            """
-            with self.lock:
-                current_time = time.time()
-
-                # Calculate when we should submit the next query based on target rate
-                expected_submission_time = self.start_time + (self.submitted_count * self.submission_interval)
-
-                # Apply feedback adjustment if we have enough completed queries
-                if len(self.completed_times) >= 10:
-                    actual_qps = self._calculate_actual_qps()
-                    if actual_qps > 0:
-                        qps_error = (actual_qps - self.target_qps) / self.target_qps
-                        # If actual QPS is higher than target, increase interval (slow down)
-                        # If actual QPS is lower than target, decrease interval (speed up)
-                        adjustment = self.submission_interval * qps_error * self.adjustment_factor
-                        self.submission_interval = max(self.min_interval, self.submission_interval + adjustment)
-
-                sleep_time = max(0, expected_submission_time - current_time)
-                return sleep_time
-
-        def record_submission(self):
-            """Record that a query was submitted."""
-            with self.lock:
-                self.submitted_count += 1
-                self.last_submission_time = time.time()
+            # Keep track of completion times for statistics
+            self.completed_times = deque(maxlen=50)
 
         def record_completion(self):
             """Record that a query was completed."""
@@ -666,17 +582,13 @@ class RedisBenchmarker:
             """Get current controller statistics."""
             with self.lock:
                 elapsed = time.time() - self.start_time
-                submitted_qps = self.submitted_count / elapsed if elapsed > 0 else 0
                 completed_qps = self.completed_count / elapsed if elapsed > 0 else 0
                 actual_qps = self._calculate_actual_qps()
 
                 return {
                     "target_qps": self.target_qps,
-                    "submitted_qps": submitted_qps,
                     "completed_qps": completed_qps,
                     "actual_qps": actual_qps,
-                    "current_interval": self.submission_interval,
-                    "submitted_count": self.submitted_count,
                     "completed_count": self.completed_count
                 }
 
@@ -885,8 +797,8 @@ class RedisBenchmarker:
             self.console.print(f"\n[cyan]QPS Controller Stats:[/cyan]")
             self.console.print(f"  Target QPS: {stats['target_qps']:.2f}")
             self.console.print(f"  Actual QPS: {stats['actual_qps']:.2f}")
-            self.console.print(f"  Submitted QPS: {stats['submitted_qps']:.2f}")
-            self.console.print(f"  Final interval: {stats['current_interval']:.4f}s")
+            self.console.print(f"  Completed QPS: {stats['completed_qps']:.2f}")
+            self.console.print(f"  Total Completed: {stats['completed_count']}")
 
         # Cleanup resources to prevent memory leaks
         cleanup_client = self._get_redis_client()
