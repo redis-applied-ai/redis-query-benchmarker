@@ -436,8 +436,15 @@ class RedisBenchmarker:
     def _progress_updater_thread(self, progress: Progress, task: TaskID, counters: ThreadSafeCounters,
                                  start_time: float, stop_event: threading.Event) -> None:
         """Background thread that automatically updates progress bar with adaptive frequency."""
-        # Adaptive update frequency based on total requests
-        update_interval = 0.5 if self.config.total_requests < 100000 else 1.0
+        # More responsive update frequency for better progress tracking
+        if self.config.total_requests <= 100:
+            update_interval = 0.1  # Very frequent updates for small test runs
+        elif self.config.total_requests <= 1000:
+            update_interval = 0.2  # Frequent updates for small runs
+        else:
+            update_interval = 0.5 if self.config.total_requests < 100000 else 1.0
+
+        last_completed_count = 0
 
         while not stop_event.is_set():
             try:
@@ -452,29 +459,39 @@ class RedisBenchmarker:
                     snapshot['total_result_count']
                 )
 
-                if self.is_interactive:
-                    # Update progress bar for interactive terminals
-                    update_fields = {
-                        "avg_latency": metrics["avg_latency"],
-                        "current_qps": metrics["current_qps"]
-                    }
+                # Always update if there's been progress or if this is the first update
+                should_update = (snapshot['completed_count'] != last_completed_count or 
+                               last_completed_count == 0)
 
-                    if self.config.show_expanded_metrics:
-                        update_fields.update({
-                            "avg_results": metrics["avg_results"],
-                            "norm_latency": metrics["norm_latency"]
-                        })
+                # Debug: Always show first few updates to understand timing
+                elapsed = time.time() - start_time
+                if elapsed < 10.0 or should_update:  # Show all updates in first 10 seconds, then only changes
+                    if self.is_interactive:
+                        # Update progress bar for interactive terminals
+                        update_fields = {
+                            "avg_latency": metrics["avg_latency"],
+                            "current_qps": metrics["current_qps"]
+                        }
 
-                    progress.update(task, completed=snapshot['completed_count'], **update_fields)
-                else:
-                    # Print status messages for non-interactive terminals
-                    percentage = (snapshot['completed_count'] / self.config.total_requests) * 100
-                    status_msg = f"Progress: {snapshot['completed_count']}/{self.config.total_requests} ({percentage:.1f}%) | Avg Latency: {metrics['avg_latency']:.1f}ms | QPS: {metrics['current_qps']:.1f}"
+                        if self.config.show_expanded_metrics:
+                            update_fields.update({
+                                "avg_results": metrics["avg_results"],
+                                "norm_latency": metrics["norm_latency"]
+                            })
 
-                    if self.config.show_expanded_metrics:
-                        status_msg += f" | Avg Results: {metrics['avg_results']:.1f} | Norm Latency: {metrics['norm_latency']:.2f}ms/result"
+                        progress.update(task, completed=snapshot['completed_count'], **update_fields)
+                    else:
+                        # Print status messages for non-interactive terminals
+                        percentage = (snapshot['completed_count'] / self.config.total_requests) * 100
+                        status_msg = f"Progress: {snapshot['completed_count']}/{self.config.total_requests} ({percentage:.1f}%) | Avg Latency: {metrics['avg_latency']:.1f}ms | QPS: {metrics['current_qps']:.1f} | t={elapsed:.2f}s"
 
-                    print(status_msg, flush=True)
+                        if self.config.show_expanded_metrics:
+                            status_msg += f" | Avg Results: {metrics['avg_results']:.1f} | Norm Latency: {metrics['norm_latency']:.2f}ms/result"
+
+                        print(status_msg, flush=True)
+
+                    if should_update:
+                        last_completed_count = snapshot['completed_count']
 
                 # Adaptive update frequency
                 stop_event.wait(update_interval)
@@ -518,11 +535,64 @@ class RedisBenchmarker:
             batch_size = 1
             batch_interval = 1.0 / target_qps
 
-        # Submit queries in controlled batches
+        # Process queries with controlled submission and concurrent result processing
         all_futures = []
         remaining_requests = total_requests
         next_batch_time = time.time()
+        submitted_count = 0
 
+        # Use a separate thread to handle result processing concurrently
+        import threading
+        from queue import Queue
+        
+        result_queue = Queue()
+        processing_complete = threading.Event()
+        
+        def result_processor():
+            """Process results as they complete, updating counters immediately."""
+            processed = 0
+            while processed < total_requests:
+                try:
+                    future = result_queue.get(timeout=1.0)
+                    try:
+                        query_result = future.result(timeout=self.config.timeout)
+                        qps_controller.record_completion()
+
+                        if "error" in query_result:
+                            errors.append(query_result["error"])
+                            counters.update_error()
+                        else:
+                            # Update incremental statistics
+                            latency_ms = query_result["latency_ms"]
+                            latency_stats_calc.add_value(latency_ms)
+
+                            # Keep samples for export
+                            latencies_sample.append(latency_ms)
+
+                            # Extract result count from metadata
+                            result_count = self._extract_result_count(query_result)
+                            result_counts_sample.append(result_count)
+
+                            # Update thread-safe counters
+                            counters.update_success(latency_ms, result_count)
+
+                    except Exception as e:
+                        errors.append(str(e))
+                        counters.update_error()
+                    
+                    processed += 1
+                    result_queue.task_done()
+                except:
+                    # Timeout waiting for results - continue checking
+                    continue
+            
+            processing_complete.set()
+
+        # Start result processor thread
+        processor_thread = threading.Thread(target=result_processor, daemon=True)
+        processor_thread.start()
+
+        # Submit queries in controlled batches while results are processed concurrently
         while remaining_requests > 0:
             # Wait until it's time for the next batch
             current_time = time.time()
@@ -533,45 +603,20 @@ class RedisBenchmarker:
             # Calculate current batch size (might be smaller for last batch)
             current_batch_size = min(batch_size, remaining_requests)
 
-            # Submit the batch of queries
-            batch_futures = []
+            # Submit the batch of queries and add to result queue immediately
             for _ in range(current_batch_size):
                 future = thread_executor.submit(self._execute_single_query, executor, connection_pool)
-                batch_futures.append(future)
                 all_futures.append(future)
+                result_queue.put(future)  # Add to queue for immediate processing
 
             remaining_requests -= current_batch_size
+            submitted_count += current_batch_size
 
             # Calculate next batch time
             next_batch_time = time.time() + batch_interval
 
-        # Process all results as they complete (preserving connection pool efficiency)
-        for future in as_completed(all_futures):
-            try:
-                query_result = future.result(timeout=self.config.timeout)
-                qps_controller.record_completion()
-
-                if "error" in query_result:
-                    errors.append(query_result["error"])
-                    counters.update_error()
-                else:
-                    # Update incremental statistics
-                    latency_ms = query_result["latency_ms"]
-                    latency_stats_calc.add_value(latency_ms)
-
-                    # Keep samples for export
-                    latencies_sample.append(latency_ms)
-
-                    # Extract result count from metadata
-                    result_count = self._extract_result_count(query_result)
-                    result_counts_sample.append(result_count)
-
-                    # Update thread-safe counters
-                    counters.update_success(latency_ms, result_count)
-
-            except Exception as e:
-                errors.append(str(e))
-                counters.update_error()
+        # Wait for all results to be processed
+        processing_complete.wait()
 
     class QpsController:
         """
@@ -800,6 +845,34 @@ class RedisBenchmarker:
                                         counters.update_error()
 
                                 remaining_requests -= current_batch_size
+
+                        # Final progress update to ensure completion is shown
+                        final_snapshot = counters.get_snapshot()
+                        final_metrics = self._calculate_metrics(
+                            start_time,
+                            final_snapshot['successful_count'],
+                            final_snapshot['total_latency'],
+                            final_snapshot['total_result_count']
+                        )
+
+                        if self.is_interactive:
+                            final_update_fields = {
+                                "avg_latency": final_metrics["avg_latency"],
+                                "current_qps": final_metrics["current_qps"]
+                            }
+                            if self.config.show_expanded_metrics:
+                                final_update_fields.update({
+                                    "avg_results": final_metrics["avg_results"],
+                                    "norm_latency": final_metrics["norm_latency"]
+                                })
+                            progress.update(task, completed=final_snapshot['completed_count'], **final_update_fields)
+                        else:
+                            # Final status message for non-interactive terminals
+                            final_percentage = (final_snapshot['completed_count'] / self.config.total_requests) * 100
+                            final_status_msg = f"Progress: {final_snapshot['completed_count']}/{self.config.total_requests} ({final_percentage:.1f}%) | Avg Latency: {final_metrics['avg_latency']:.1f}ms | QPS: {final_metrics['current_qps']:.1f}"
+                            if self.config.show_expanded_metrics:
+                                final_status_msg += f" | Avg Results: {final_metrics['avg_results']:.1f} | Norm Latency: {final_metrics['norm_latency']:.2f}ms/result"
+                            print(final_status_msg, flush=True)
 
                         # Stop progress updater thread when benchmark completes normally
                         stop_progress_event.set()
