@@ -434,7 +434,7 @@ class RedisBenchmarker:
         }
 
     def _progress_updater_thread(self, progress: Progress, task: TaskID, counters: ThreadSafeCounters,
-                                 start_time: float, stop_event: threading.Event) -> None:
+                                 start_time: float, stop_event: threading.Event, qps_controller=None) -> None:
         """Background thread that automatically updates progress bar with adaptive frequency."""
         # More responsive update frequency for better progress tracking
         if self.config.total_requests <= 100:
@@ -459,6 +459,14 @@ class RedisBenchmarker:
                     snapshot['total_result_count']
                 )
 
+                # Get current target QPS if jitter controller is available
+                current_target_qps = None
+                if qps_controller:
+                    if hasattr(qps_controller, 'get_current_target_qps'):
+                        current_target_qps = qps_controller.get_current_target_qps()
+                    elif hasattr(qps_controller, 'target_qps'):
+                        current_target_qps = qps_controller.target_qps
+
                 # Always update if there's been progress or if this is the first update
                 should_update = (snapshot['completed_count'] != last_completed_count or 
                                last_completed_count == 0)
@@ -473,6 +481,10 @@ class RedisBenchmarker:
                             "current_qps": metrics["current_qps"]
                         }
 
+                        # Add target QPS if available
+                        if current_target_qps is not None:
+                            update_fields["target_qps"] = current_target_qps
+
                         if self.config.show_expanded_metrics:
                             update_fields.update({
                                 "avg_results": metrics["avg_results"],
@@ -483,7 +495,13 @@ class RedisBenchmarker:
                     else:
                         # Print status messages for non-interactive terminals
                         percentage = (snapshot['completed_count'] / self.config.total_requests) * 100
-                        status_msg = f"Progress: {snapshot['completed_count']}/{self.config.total_requests} ({percentage:.1f}%) | Avg Latency: {metrics['avg_latency']:.1f}ms | QPS: {metrics['current_qps']:.1f} | t={elapsed:.2f}s"
+                        status_msg = f"Progress: {snapshot['completed_count']}/{self.config.total_requests} ({percentage:.1f}%) | Avg Latency: {metrics['avg_latency']:.1f}ms | QPS: {metrics['current_qps']:.1f}"
+                        
+                        # Add target QPS if available (shows jitter in action)
+                        if current_target_qps is not None:
+                            status_msg += f" | Target: {current_target_qps:.1f}"
+                        
+                        status_msg += f" | t={elapsed:.2f}s"
 
                         if self.config.show_expanded_metrics:
                             status_msg += f" | Avg Results: {metrics['avg_results']:.1f} | Norm Latency: {metrics['norm_latency']:.2f}ms/result"
@@ -633,11 +651,12 @@ class RedisBenchmarker:
         Periodically recalculates target QPS based on configured jitter parameters.
         """
 
-        def __init__(self, base_qps: float, jitter_percent: float, jitter_interval: float, distribution: str = "uniform"):
+        def __init__(self, base_qps: float, jitter_percent: float, jitter_interval: float, distribution: str = "uniform", direction: str = "random"):
             self.base_qps = base_qps
             self.jitter_percent = jitter_percent
             self.jitter_interval = jitter_interval
             self.distribution = distribution
+            self.direction = direction
             
             self.current_target_qps = base_qps
             self.last_jitter_update = time.time()
@@ -652,39 +671,67 @@ class RedisBenchmarker:
             self._recalculate_jitter()
 
         def _recalculate_jitter(self):
-            """Recalculate target QPS based on jitter distribution."""
+            """Recalculate target QPS based on jitter distribution and direction."""
             jitter_factor = self.jitter_percent / 100.0
             
+            # First, calculate the base jitter multiplier based on distribution
             if self.distribution == "uniform":
                 # Uniform distribution: ±jitter_percent with equal probability
-                jitter_multiplier = 1.0 + random.uniform(-jitter_factor, jitter_factor)
+                raw_jitter = random.uniform(-jitter_factor, jitter_factor)
             
             elif self.distribution == "normal":
                 # Normal distribution: centered on base_qps with std_dev = jitter_percent/3
                 std_dev = jitter_factor / 3.0  # 99.7% of values within ±jitter_percent
-                jitter_multiplier = 1.0 + random.gauss(0, std_dev)
+                raw_jitter = random.gauss(0, std_dev)
                 # Clamp to reasonable bounds
-                jitter_multiplier = max(1.0 - jitter_factor, min(1.0 + jitter_factor, jitter_multiplier))
+                raw_jitter = max(-jitter_factor, min(jitter_factor, raw_jitter))
             
             elif self.distribution == "triangular":
                 # Triangular distribution: more likely to be near base_qps
-                jitter_multiplier = 1.0 + random.triangular(-jitter_factor, jitter_factor, 0)
+                raw_jitter = random.triangular(-jitter_factor, jitter_factor, 0)
             
             elif self.distribution == "bursty":
                 # Bursty distribution: 80% normal traffic, 20% spikes
                 if random.random() < 0.8:
                     # Normal traffic: slight variation
-                    jitter_multiplier = 1.0 + random.uniform(-jitter_factor * 0.3, jitter_factor * 0.3)
+                    raw_jitter = random.uniform(-jitter_factor * 0.3, jitter_factor * 0.3)
                 else:
                     # Traffic spike: significant increase
-                    jitter_multiplier = 1.0 + random.uniform(jitter_factor * 0.5, jitter_factor)
+                    raw_jitter = random.uniform(jitter_factor * 0.5, jitter_factor)
             
             else:
                 # Fallback to uniform
-                jitter_multiplier = 1.0 + random.uniform(-jitter_factor, jitter_factor)
+                raw_jitter = random.uniform(-jitter_factor, jitter_factor)
             
-            # Ensure we don't go below zero or negative QPS
-            jitter_multiplier = max(0.1, jitter_multiplier)
+            # Apply direction coordination for distributed environments
+            if self.direction == "positive":
+                # Force all jitter to be positive (traffic spikes)
+                jitter_multiplier = 1.0 + abs(raw_jitter)
+            
+            elif self.direction == "negative":
+                # Force all jitter to be negative (traffic dips)
+                jitter_multiplier = 1.0 - abs(raw_jitter)
+            
+            elif self.direction == "alternating":
+                # Coordinated alternating pattern based on global time
+                # All pods will synchronize to the same high/low phase
+                current_time = time.time()
+                phase_number = int(current_time // self.jitter_interval)
+                is_high_phase = (phase_number % 2) == 0
+                
+                if is_high_phase:
+                    # High phase: use positive jitter
+                    jitter_multiplier = 1.0 + abs(raw_jitter)
+                else:
+                    # Low phase: use negative jitter
+                    jitter_multiplier = 1.0 - abs(raw_jitter)
+            
+            else:  # "random" or default
+                # Original random behavior
+                jitter_multiplier = 1.0 + raw_jitter
+            
+            # Ensure we don't go below zero or unreasonably low QPS
+            jitter_multiplier = max(0.05, jitter_multiplier)  # Allow lower minimum for distributed scenarios
             
             self.current_target_qps = self.base_qps * jitter_multiplier
             self.last_jitter_update = time.time()
@@ -727,7 +774,8 @@ class RedisBenchmarker:
                     "actual_qps": actual_qps,
                     "completed_count": self.completed_count,
                     "jitter_percent": self.jitter_percent,
-                    "jitter_distribution": self.distribution
+                    "jitter_distribution": self.distribution,
+                    "jitter_direction": self.direction
                 }
 
     class QpsController:
@@ -831,6 +879,22 @@ class RedisBenchmarker:
         # Thread-safe counters for progress tracking
         counters = ThreadSafeCounters()
 
+        # Initialize QPS controller if QPS limiting is enabled (needed for progress bar setup)
+        qps_controller = None
+        if self.config.qps:
+            if self.config.jitter_enabled:
+                qps_controller = self.JitteredQpsController(
+                    self.config.qps,
+                    self.config.jitter_percent,
+                    self.config.jitter_interval_secs,
+                    self.config.jitter_distribution,
+                    self.config.jitter_direction
+                )
+                if self.config.verbose:
+                    self.console.print(f"[cyan]Using jittered QPS controller: {self.config.qps}±{self.config.jitter_percent}% ({self.config.jitter_distribution} distribution, {self.config.jitter_direction} direction)[/cyan]")
+            else:
+                qps_controller = self.QpsController(self.config.qps)
+
         # Custom progress bar with real-time metrics
         progress_columns = [
             SpinnerColumn(),
@@ -844,6 +908,13 @@ class RedisBenchmarker:
             TextColumn("•"),
             TextColumn("[bold cyan]QPS: {task.fields[current_qps]:.1f}"),
         ]
+
+        # Add target QPS column if QPS limiting is enabled
+        if qps_controller:
+            progress_columns.extend([
+                TextColumn("•"),
+                TextColumn("[bold yellow]Target: {task.fields[target_qps]:.1f}"),
+            ])
 
         if self.config.show_expanded_metrics:
             progress_columns.extend([
@@ -878,6 +949,11 @@ class RedisBenchmarker:
                     "current_qps": 0.0
                 }
 
+                # Add target QPS field if QPS limiting is enabled
+                if qps_controller:
+                    initial_target = qps_controller.get_current_target_qps() if hasattr(qps_controller, 'get_current_target_qps') else qps_controller.target_qps
+                    task_fields["target_qps"] = initial_target
+
                 if self.config.show_expanded_metrics:
                     task_fields.update({
                         "avg_results": 0.0,
@@ -894,7 +970,7 @@ class RedisBenchmarker:
                 stop_progress_event = threading.Event()
                 progress_thread = threading.Thread(
                     target=self._progress_updater_thread,
-                    args=(progress, task, counters, start_time, stop_progress_event),
+                    args=(progress, task, counters, start_time, stop_progress_event, qps_controller),
                     daemon=True
                 )
                 progress_thread.start()
@@ -907,20 +983,7 @@ class RedisBenchmarker:
                         remaining_requests = self.config.total_requests
                         all_futures = []
 
-                        # Initialize QPS controller if QPS limiting is enabled
-                        qps_controller = None
-                        if self.config.qps:
-                            if self.config.jitter_enabled:
-                                qps_controller = self.JitteredQpsController(
-                                    self.config.qps,
-                                    self.config.jitter_percent,
-                                    self.config.jitter_interval_secs,
-                                    self.config.jitter_distribution
-                                )
-                                if self.config.verbose:
-                                    self.console.print(f"[cyan]Using jittered QPS controller: {self.config.qps}±{self.config.jitter_percent}% ({self.config.jitter_distribution} distribution)[/cyan]")
-                            else:
-                                qps_controller = self.QpsController(self.config.qps)
+                        # QPS controller already initialized above
 
                         # Process queries efficiently with proper threading
                         if qps_controller:
@@ -979,11 +1042,23 @@ class RedisBenchmarker:
                             final_snapshot['total_result_count']
                         )
 
+                        # Get final target QPS
+                        final_target_qps = None
+                        if qps_controller:
+                            if hasattr(qps_controller, 'get_current_target_qps'):
+                                final_target_qps = qps_controller.get_current_target_qps()
+                            elif hasattr(qps_controller, 'target_qps'):
+                                final_target_qps = qps_controller.target_qps
+
                         if self.is_interactive:
                             final_update_fields = {
                                 "avg_latency": final_metrics["avg_latency"],
                                 "current_qps": final_metrics["current_qps"]
                             }
+                            
+                            if final_target_qps is not None:
+                                final_update_fields["target_qps"] = final_target_qps
+                                
                             if self.config.show_expanded_metrics:
                                 final_update_fields.update({
                                     "avg_results": final_metrics["avg_results"],
@@ -994,6 +1069,10 @@ class RedisBenchmarker:
                             # Final status message for non-interactive terminals
                             final_percentage = (final_snapshot['completed_count'] / self.config.total_requests) * 100
                             final_status_msg = f"Progress: {final_snapshot['completed_count']}/{self.config.total_requests} ({final_percentage:.1f}%) | Avg Latency: {final_metrics['avg_latency']:.1f}ms | QPS: {final_metrics['current_qps']:.1f}"
+                            
+                            if final_target_qps is not None:
+                                final_status_msg += f" | Target: {final_target_qps:.1f}"
+                                
                             if self.config.show_expanded_metrics:
                                 final_status_msg += f" | Avg Results: {final_metrics['avg_results']:.1f} | Norm Latency: {final_metrics['norm_latency']:.2f}ms/result"
                             print(final_status_msg, flush=True)
@@ -1032,7 +1111,7 @@ class RedisBenchmarker:
                 # Jittered controller stats
                 self.console.print(f"  Base QPS: {stats['base_qps']:.2f}")
                 self.console.print(f"  Current Target QPS: {stats['current_target_qps']:.2f}")
-                self.console.print(f"  Jitter: ±{stats['jitter_percent']:.1f}% ({stats['jitter_distribution']})")
+                self.console.print(f"  Jitter: ±{stats['jitter_percent']:.1f}% ({stats['jitter_distribution']}, {stats['jitter_direction']} direction)")
             else:
                 # Regular controller stats
                 self.console.print(f"  Target QPS: {stats['target_qps']:.2f}")

@@ -49,6 +49,9 @@ from .executors import list_query_executors
 @click.option('--jitter-distribution', default='uniform', 
               type=click.Choice(['uniform', 'normal', 'triangular', 'bursty']),
               help='Jitter distribution type', show_default=True)
+@click.option('--jitter-direction', default='random',
+              type=click.Choice(['random', 'positive', 'negative', 'alternating']),
+              help='Jitter direction for distributed coordination', show_default=True)
 def main(**kwargs):
     """Redis Query Benchmarker - Benchmark Redis search queries with configurable executors."""
 
@@ -100,6 +103,7 @@ def main(**kwargs):
                 jitter_percent=kwargs['jitter_percent'],
                 jitter_interval_secs=kwargs['jitter_interval_secs'],
                 jitter_distribution=kwargs['jitter_distribution'],
+                jitter_direction=kwargs['jitter_direction'],
                 extra_params=extra_params
             )
 
@@ -129,7 +133,7 @@ def main(**kwargs):
         click.echo(f"Workers: {config.workers}")
         click.echo(f"QPS: {config.qps}")
         if config.qps and config.jitter_enabled:
-            click.echo(f"Jitter: ±{config.jitter_percent}% ({config.jitter_distribution}, {config.jitter_interval_secs}s intervals)")
+            click.echo(f"Jitter: ±{config.jitter_percent}% ({config.jitter_distribution}, {config.jitter_direction} direction, {config.jitter_interval_secs}s intervals)")
         if config.index_name:
             click.echo(f"Index: {config.index_name}")
         if config.sample_file:

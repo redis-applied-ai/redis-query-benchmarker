@@ -56,6 +56,7 @@ class BenchmarkConfig(BaseModel):
     jitter_percent: float = Field(default=10.0, description="QPS jitter percentage (±)", ge=0, le=100)
     jitter_interval_secs: float = Field(default=5.0, description="Jitter recalculation interval in seconds", ge=0.1)
     jitter_distribution: str = Field(default="uniform", description="Jitter distribution type (uniform, normal, triangular, bursty)")
+    jitter_direction: str = Field(default="random", description="Jitter direction for distributed coordination (random, positive, negative, alternating)")
 
     @field_validator('workers')
     @classmethod
@@ -76,6 +77,13 @@ class BenchmarkConfig(BaseModel):
     def validate_jitter_distribution(cls, v):
         if v not in ['uniform', 'normal', 'triangular', 'bursty']:
             raise ValueError('Jitter distribution must be uniform, normal, triangular, or bursty')
+        return v
+
+    @field_validator('jitter_direction')
+    @classmethod
+    def validate_jitter_direction(cls, v):
+        if v not in ['random', 'positive', 'negative', 'alternating']:
+            raise ValueError('Jitter direction must be random, positive, negative, or alternating')
         return v
 
     @field_validator('jitter_enabled')
