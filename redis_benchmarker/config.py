@@ -48,6 +48,7 @@ class BenchmarkConfig(BaseModel):
     timeout: float = Field(default=30.0, description="Query timeout in seconds")
     qps: Optional[float] = Field(default=None, description="Target queries per second (QPS)")
     sample_file: Optional[str] = Field(default=None, description="File path containing sample queries (one per line)")
+    pre_warm_connections: int = Field(default=0, description="Number of connections to pre-warm in the pool", ge=0)
     extra_params: Dict[str, Any] = Field(default_factory=dict, description="Extra parameters")
 
     @field_validator('workers')

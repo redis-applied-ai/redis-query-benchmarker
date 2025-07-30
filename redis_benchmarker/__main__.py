@@ -42,6 +42,7 @@ from .executors import list_query_executors
 @click.option('--qps', default=None, type=float, help='Target queries per second (QPS)')
 @click.option('--sample-file', default=None, help='File path containing sample queries (one per line)')
 @click.option('--resp', default=2, type=click.IntRange(2, 3), help='Redis protocol version (2 or 3)')
+@click.option('--pre-warm', default=0, type=int, help='Number of connections to pre-warm in the pool (0 = disabled)')
 def main(**kwargs):
     """Redis Query Benchmarker - Benchmark Redis search queries with configurable executors."""
 
@@ -88,6 +89,7 @@ def main(**kwargs):
                 show_expanded_metrics=kwargs['show_expanded_metrics'],
                 qps=kwargs['qps'],
                 sample_file=kwargs['sample_file'],
+                pre_warm_connections=kwargs['pre_warm'],
                 extra_params=extra_params
             )
 

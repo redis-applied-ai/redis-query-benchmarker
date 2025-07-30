@@ -280,6 +280,73 @@ class RedisBenchmarker:
         """Get Redis client using the connection pool."""
         return redis.Redis(connection_pool=self._create_connection_pool())
 
+    def _prewarm_connection_pool_direct(self, min_connections: int) -> None:
+        """
+        Pre-warm the connection pool using direct pool connection management.
+
+        This method creates the specified number of connections by directly
+        using the pool's get_connection() method, exercises each connection
+        with a PING command, and then releases them back to the pool.
+
+        Args:
+            min_connections: Number of connections to pre-create and warm
+        """
+        if min_connections <= 0:
+            return
+
+        connection_pool = self._create_connection_pool()
+        raw_connections = []
+
+        try:
+            self.console.print(f"Pre-warming {min_connections} connections...")
+
+            # Directly get connections from pool
+            for i in range(min_connections):
+                try:
+                    # get_connection() requires a command_name parameter
+                    conn = connection_pool.get_connection("PING")
+                    conn.connect()  # Establish the connection
+
+                    # Exercise the connection with PING
+                    conn.send_command("PING")
+                    response = conn.read_response()
+
+                    if response != b"PONG" and response != "PONG":
+                        self.console.print(f"Warning: Unexpected PING response: {response}")
+
+                    # Optional: test index access if configured
+                    if self.config.index_name:
+                        try:
+                            conn.send_command("FT.INFO", self.config.index_name)
+                            conn.read_response()  # Read and discard the response
+                        except Exception:
+                            # Index might not exist or command might fail, continue anyway
+                            pass
+
+                    raw_connections.append(conn)
+
+                    if self.config.verbose:
+                        self.console.print(f"✓ Pre-warmed connection {i+1}/{min_connections}")
+
+                except Exception as e:
+                    self.console.print(f"Warning: Failed to pre-warm connection {i+1}: {e}")
+                    break
+
+            created_count = len(raw_connections)
+            if created_count > 0:
+                self.console.print(f"Successfully pre-warmed {created_count} connections")
+            else:
+                self.console.print("Warning: No connections were pre-warmed")
+
+        finally:
+            # Release all connections back to pool
+            for conn in raw_connections:
+                try:
+                    connection_pool.release(conn)
+                except Exception as e:
+                    if self.config.verbose:
+                        self.console.print(f"Warning: Failed to release connection: {e}")
+
     def _execute_single_query(self, executor: BaseQueryExecutor, connection_pool: redis.ConnectionPool) -> Dict[str, Any]:
         """Execute a single query with error handling."""
         redis_client = redis.Redis(connection_pool=connection_pool)
@@ -637,6 +704,10 @@ class RedisBenchmarker:
         finally:
             prep_client.close()
 
+        # Pre-warm connection pool if configured
+        if self.config.pre_warm_connections > 0:
+            self._prewarm_connection_pool_direct(self.config.pre_warm_connections)
+
         # Run warmup
         self._run_warmup(executor)
 
@@ -740,25 +811,25 @@ class RedisBenchmarker:
                             # QPS-controlled submission with efficient async processing
                             self._run_qps_controlled_benchmark(
                                 thread_executor, executor, connection_pool, remaining_requests,
-                                qps_controller, latency_stats_calc, latencies_sample, 
+                                qps_controller, latency_stats_calc, latencies_sample,
                                 result_counts_sample, errors, counters
                             )
                         else:
                             # Original high-performance batch processing for unlimited QPS
                             while remaining_requests > 0:
                                 current_batch_size = min(batch_size, remaining_requests)
-                                
+
                                 # Submit batch of futures
                                 batch_futures = [
                                     thread_executor.submit(self._execute_single_query, executor, connection_pool)
                                     for _ in range(current_batch_size)
                                 ]
-                                
+
                                 # Process batch results asynchronously
                                 for future in as_completed(batch_futures):
                                     try:
                                         query_result = future.result(timeout=self.config.timeout)
-                                        
+
                                         if "error" in query_result:
                                             errors.append(query_result["error"])
                                             counters.update_error()
@@ -766,21 +837,21 @@ class RedisBenchmarker:
                                             # Update incremental statistics
                                             latency_ms = query_result["latency_ms"]
                                             latency_stats_calc.add_value(latency_ms)
-                                            
+
                                             # Keep samples for export
                                             latencies_sample.append(latency_ms)
-                                            
+
                                             # Extract result count from metadata
                                             result_count = self._extract_result_count(query_result)
                                             result_counts_sample.append(result_count)
-                                            
+
                                             # Update thread-safe counters (progress thread will read these)
                                             counters.update_success(latency_ms, result_count)
-                                    
+
                                     except Exception as e:
                                         errors.append(str(e))
                                         counters.update_error()
-                                
+
                                 remaining_requests -= current_batch_size
 
                         # Stop progress updater thread when benchmark completes normally

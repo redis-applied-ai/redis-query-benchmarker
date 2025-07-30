@@ -66,6 +66,8 @@ python my_executor.py --total-requests 1000 --workers 16 --index-name my_index
 
 That's it! You now have a fully functional benchmark tool with detailed performance metrics.
 
+> **💡 Performance Tip**: For better performance with many workers, add `--pre-warm 16` to pre-create connections and reduce first-query latency.
+
 ## Features
 
 - 🚀 **High-performance concurrent benchmarking** with configurable workers
@@ -73,6 +75,8 @@ That's it! You now have a fully functional benchmark tool with detailed performa
 - 🎲 **Built-in data generation** for creating test datasets
 - ⚙️ **Flexible configuration** via CLI arguments
 - 📈 **Multiple output formats** (console, JSON, CSV)
+- 🔌 **Connection pool optimization** with pre-warming and configurable limits
+- 📁 **Sample query support** for loading queries from files (including gzip)
 
 ## Data Generation
 
@@ -177,9 +181,46 @@ python my_executor.py \
     --password mypassword \
     --total-requests 1000 \
     --workers 16 \
+    --pre-warm 5 \
+    --max-connections 50 \
     --output-format json \
     --output-file results.json
 ```
+
+### Connection Pool Optimization
+
+For high-performance benchmarking, you can optimize Redis connection management:
+
+#### Pre-warming Connections
+
+The `--pre-warm` option creates and exercises connections before the benchmark starts, reducing first-query latency:
+
+```bash
+# Pre-warm 5 connections before starting benchmark
+python my_executor.py \
+    --pre-warm 5 \
+    --total-requests 1000 \
+    --workers 16 \
+    --index-name my_index
+```
+
+Benefits of connection pre-warming:
+- **🚀 Reduced First-Query Latency**: Connections are established and ready
+- **📊 More Consistent Results**: Eliminates connection setup from timing measurements
+- **⚡ Better Resource Utilization**: Connections are tested with PING and optional index access
+- **🎯 Production-Ready**: Simulates real-world connection patterns
+
+#### Connection Pool Configuration
+
+```bash
+# Configure connection pool settings
+python my_executor.py \
+    --max-connections 50 \     # Maximum connections in pool
+    --pre-warm 10 \           # Pre-create 10 connections
+    --workers 16              # 16 concurrent workers
+```
+
+**Recommendation**: Set `--pre-warm` to match your `--workers` count for optimal performance.
 
 ## Examples
 

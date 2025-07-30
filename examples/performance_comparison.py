@@ -115,6 +115,53 @@ def query_type_comparison():
     return run_comparison_test("Query Type Comparison", configs)
 
 
+def connection_pool_optimization_test():
+    """Test the performance impact of connection pool pre-warming."""
+
+    configs = []
+
+    # Test without pre-warming
+    config_no_prewarm = BenchmarkConfig(
+        total_requests=1000,
+        workers=16,
+        query_type="vector_search",
+        index_name="sample_index",
+        vector_dim=1536,
+        num_results=10,
+        pre_warm_connections=0,  # No pre-warming
+        max_connections=32
+    )
+    configs.append(config_no_prewarm)
+
+    # Test with pre-warming (match worker count)
+    config_with_prewarm = BenchmarkConfig(
+        total_requests=1000,
+        workers=16,
+        query_type="vector_search",
+        index_name="sample_index",
+        vector_dim=1536,
+        num_results=10,
+        pre_warm_connections=16,  # Pre-warm connections for all workers
+        max_connections=32
+    )
+    configs.append(config_with_prewarm)
+
+    # Test with over-provisioned pre-warming
+    config_over_prewarm = BenchmarkConfig(
+        total_requests=1000,
+        workers=16,
+        query_type="vector_search",
+        index_name="sample_index",
+        vector_dim=1536,
+        num_results=10,
+        pre_warm_connections=24,  # More than workers
+        max_connections=32
+    )
+    configs.append(config_over_prewarm)
+
+    return run_comparison_test("Connection Pool Optimization", configs)
+
+
 def vector_dimension_test():
     """Test performance with different vector dimensions."""
 
@@ -226,6 +273,9 @@ def main():
         time.sleep(2)  # Brief pause between tests
 
         all_results["Query Types"] = query_type_comparison()
+        time.sleep(2)
+
+        all_results["Connection Pool Optimization"] = connection_pool_optimization_test()
         time.sleep(2)
 
         all_results["Vector Dimensions"] = vector_dimension_test()

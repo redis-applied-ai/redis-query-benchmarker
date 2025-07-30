@@ -9,6 +9,9 @@ USAGE:
 ------
 python ultra_simple_executor.py --total-requests 1000 --workers 16
 
+# For better performance with many workers, pre-warm connections:
+# python ultra_simple_executor.py --total-requests 1000 --workers 16 --pre-warm 16
+
 That's it! Minimal setup, maximum functionality.
 """
 
