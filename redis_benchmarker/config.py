@@ -57,6 +57,9 @@ class BenchmarkConfig(BaseModel):
     jitter_interval_secs: float = Field(default=5.0, description="Jitter recalculation interval in seconds", ge=0.1)
     jitter_distribution: str = Field(default="uniform", description="Jitter distribution type (uniform, normal, triangular, bursty)")
     jitter_direction: str = Field(default="random", description="Jitter direction for distributed coordination (random, positive, negative, alternating)")
+    
+    # Query processing settings
+    epsilon: Optional[float] = Field(default=None, description="Epsilon value for query processing")
 
     @field_validator('workers')
     @classmethod
