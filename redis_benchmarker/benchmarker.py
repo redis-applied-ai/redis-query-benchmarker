@@ -621,11 +621,20 @@ class RedisBenchmarker:
                 batch_size = 1
                 batch_interval = 1.0 / current_target_qps
             
+            # Check adaptive rate limiting before submission
+            if not qps_controller.should_submit_batch(current_batch_size):
+                # Apply adaptive backpressure - skip this submission cycle
+                adaptive_delay = qps_controller.calculate_adaptive_delay(batch_interval)
+                time.sleep(adaptive_delay)
+                continue
+                
             # Wait until it's time for the next batch
             current_time = time.time()
             if current_time < next_batch_time:
-                sleep_time = next_batch_time - current_time
-                time.sleep(sleep_time)
+                base_sleep_time = next_batch_time - current_time
+                # Apply adaptive delay adjustment
+                adaptive_sleep_time = qps_controller.calculate_adaptive_delay(base_sleep_time)
+                time.sleep(adaptive_sleep_time)
 
             # Calculate current batch size (might be smaller for last batch)
             current_batch_size = min(batch_size, remaining_requests)
@@ -639,11 +648,126 @@ class RedisBenchmarker:
             remaining_requests -= current_batch_size
             submitted_count += current_batch_size
 
-            # Calculate next batch time
+            # Calculate next batch time (base interval, adaptive adjustment applied above)
             next_batch_time = time.time() + batch_interval
 
         # Wait for all results to be processed
         processing_complete.wait()
+
+    class AdaptiveQpsWrapper:
+        """
+        Adaptive wrapper that enhances any QPS controller with completion-aware rate limiting.
+        Prevents QPS overshooting after latency spikes by tracking completion patterns and
+        applying backpressure when completion rates exceed targets.
+        """
+
+        def __init__(self, base_controller, tolerance_percent: float = 10.0, window_size: int = 50):
+            self.base_controller = base_controller
+            self.tolerance_percent = tolerance_percent
+            self.tolerance_factor = 1.0 + (tolerance_percent / 100.0)
+            
+            # Completion rate tracking
+            self.completion_times = deque(maxlen=window_size)
+            self.submission_debt = 0.0  # Track submission vs completion imbalance
+            self.lock = threading.Lock()
+            
+            # Adaptive parameters
+            self.min_submission_delay = 0.001  # 1ms minimum delay
+            self.max_submission_delay = 5.0    # 5s maximum delay
+            
+        def get_current_target_qps(self) -> float:
+            """Delegate to base controller."""
+            if hasattr(self.base_controller, 'get_current_target_qps'):
+                return self.base_controller.get_current_target_qps()
+            elif hasattr(self.base_controller, 'target_qps'):
+                return self.base_controller.target_qps
+            return 0.0
+            
+        def record_completion(self):
+            """Record completion and update adaptive state."""
+            with self.lock:
+                current_time = time.time()
+                self.completion_times.append(current_time)
+                
+                # Reduce submission debt when completions occur
+                self.submission_debt = max(0.0, self.submission_debt - 0.5)
+                
+            # Delegate to base controller
+            self.base_controller.record_completion()
+            
+        def should_submit_batch(self, batch_size: int) -> bool:
+            """
+            Determine if a batch should be submitted now based on completion patterns.
+            Returns True if submission should proceed, False if backpressure should be applied.
+            """
+            with self.lock:
+                target_qps = self.get_current_target_qps()
+                if target_qps <= 0 or len(self.completion_times) < 5:
+                    return True  # Not enough data, allow submission
+                    
+                # Calculate recent completion rate
+                recent_completion_rate = self._calculate_recent_completion_rate()
+                
+                # Check if completion rate exceeds tolerance
+                if recent_completion_rate > (target_qps * self.tolerance_factor):
+                    # Apply backpressure - accumulate submission debt
+                    overshoot_ratio = recent_completion_rate / target_qps
+                    self.submission_debt += (overshoot_ratio - 1.0) * batch_size
+                    
+                    # Probabilistic backpressure based on overshoot severity
+                    backpressure_probability = min(0.9, (overshoot_ratio - 1.0) / 2.0)
+                    return random.random() > backpressure_probability
+                    
+                return True
+                
+        def calculate_adaptive_delay(self, base_delay: float) -> float:
+            """
+            Calculate adaptive submission delay based on completion patterns and submission debt.
+            """
+            with self.lock:
+                if self.submission_debt <= 0:
+                    return base_delay
+                    
+                # Apply exponential backoff based on submission debt
+                debt_factor = min(3.0, 1.0 + (self.submission_debt / 20.0))
+                adaptive_delay = base_delay * debt_factor
+                
+                # Clamp to reasonable bounds
+                return max(self.min_submission_delay, min(self.max_submission_delay, adaptive_delay))
+                
+        def _calculate_recent_completion_rate(self) -> float:
+            """
+            Calculate recent completion rate from completion times window.
+            Must be called with lock held.
+            """
+            if len(self.completion_times) < 2:
+                return 0.0
+                
+            time_span = self.completion_times[-1] - self.completion_times[0]
+            if time_span <= 0:
+                return 0.0
+                
+            return (len(self.completion_times) - 1) / time_span
+            
+        def get_stats(self) -> Dict[str, float]:
+            """Get combined stats from base controller and adaptive wrapper."""
+            base_stats = self.base_controller.get_stats()
+            
+            with self.lock:
+                recent_completion_rate = self._calculate_recent_completion_rate()
+                adaptive_stats = {
+                    "recent_completion_rate": recent_completion_rate,
+                    "submission_debt": self.submission_debt,
+                    "tolerance_factor": self.tolerance_factor,
+                }
+                
+            # Merge stats
+            base_stats.update(adaptive_stats)
+            return base_stats
+            
+        def __getattr__(self, name):
+            """Delegate unknown attributes to base controller."""
+            return getattr(self.base_controller, name)
 
     class JitteredQpsController:
         """
@@ -882,18 +1006,25 @@ class RedisBenchmarker:
         # Initialize QPS controller if QPS limiting is enabled (needed for progress bar setup)
         qps_controller = None
         if self.config.qps:
+            # Create base controller
             if self.config.jitter_enabled:
-                qps_controller = self.JitteredQpsController(
+                base_controller = self.JitteredQpsController(
                     self.config.qps,
                     self.config.jitter_percent,
                     self.config.jitter_interval_secs,
                     self.config.jitter_distribution,
                     self.config.jitter_direction
                 )
-                if self.config.verbose:
-                    self.console.print(f"[cyan]Using jittered QPS controller: {self.config.qps}±{self.config.jitter_percent}% ({self.config.jitter_distribution} distribution, {self.config.jitter_direction} direction)[/cyan]")
+                controller_description = f"jittered QPS controller: {self.config.qps}±{self.config.jitter_percent}% ({self.config.jitter_distribution} distribution, {self.config.jitter_direction} direction)"
             else:
-                qps_controller = self.QpsController(self.config.qps)
+                base_controller = self.QpsController(self.config.qps)
+                controller_description = f"QPS controller: {self.config.qps}"
+                
+            # Wrap with adaptive completion rate limiting
+            qps_controller = self.AdaptiveQpsWrapper(base_controller)
+            
+            if self.config.verbose:
+                self.console.print(f"[cyan]Using adaptive {controller_description} with completion rate limiting[/cyan]")
 
         # Custom progress bar with real-time metrics
         progress_columns = [
@@ -1105,7 +1236,7 @@ class RedisBenchmarker:
         # Print QPS controller stats if enabled
         if qps_controller and self.config.verbose:
             stats = qps_controller.get_stats()
-            self.console.print(f"\n[cyan]QPS Controller Stats:[/cyan]")
+            self.console.print(f"\n[cyan]Adaptive QPS Controller Stats:[/cyan]")
             
             if 'base_qps' in stats:
                 # Jittered controller stats
@@ -1118,7 +1249,17 @@ class RedisBenchmarker:
             
             self.console.print(f"  Actual QPS: {stats['actual_qps']:.2f}")
             self.console.print(f"  Completed QPS: {stats['completed_qps']:.2f}")
+            self.console.print(f"  Recent Completion Rate: {stats.get('recent_completion_rate', 0.0):.2f}")
+            self.console.print(f"  Submission Debt: {stats.get('submission_debt', 0.0):.1f}")
             self.console.print(f"  Total Completed: {stats['completed_count']}")
+            
+            # Show adaptive effectiveness
+            target = stats.get('current_target_qps', stats.get('target_qps', 0))
+            recent_rate = stats.get('recent_completion_rate', 0)
+            if target > 0 and recent_rate > 0:
+                overshoot_pct = ((recent_rate - target) / target) * 100
+                if abs(overshoot_pct) > 1:
+                    self.console.print(f"  Rate Variance: {overshoot_pct:+.1f}%")
 
         # Cleanup resources to prevent memory leaks
         cleanup_client = self._get_redis_client()
