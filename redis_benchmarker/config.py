@@ -60,6 +60,9 @@ class BenchmarkConfig(BaseModel):
     
     # Query processing settings
     epsilon: Optional[float] = Field(default=None, description="Epsilon value for query processing")
+    
+    # Adaptive QPS control settings
+    qps_tolerance_percent: float = Field(default=10.0, description="QPS tolerance percentage for adaptive rate limiting", ge=1.0, le=50.0)
 
     @field_validator('workers')
     @classmethod

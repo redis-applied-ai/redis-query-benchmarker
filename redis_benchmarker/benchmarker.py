@@ -666,14 +666,43 @@ class RedisBenchmarker:
             self.tolerance_percent = tolerance_percent
             self.tolerance_factor = 1.0 + (tolerance_percent / 100.0)
             
+            # Get target QPS to optimize parameters for low QPS scenarios
+            target_qps = self.get_base_target_qps()
+            
+            # Auto-optimize parameters for low QPS (≤5 QPS)
+            if target_qps <= 5.0:
+                # Smaller window for faster reaction at low QPS
+                window_size = min(window_size, max(10, int(target_qps * 10)))  # 10-50 samples
+                # More sensitive tolerance for low QPS
+                if tolerance_percent == 10.0:  # Only adjust if using default
+                    self.tolerance_percent = max(5.0, tolerance_percent / 2)  # 5% tolerance
+                    self.tolerance_factor = 1.0 + (self.tolerance_percent / 100.0)
+                # Reduced minimum completion threshold
+                self.min_completions_threshold = max(2, int(target_qps))  # 2-5 completions
+            else:
+                self.min_completions_threshold = 5  # Standard threshold for higher QPS
+            
             # Completion rate tracking
             self.completion_times = deque(maxlen=window_size)
             self.submission_debt = 0.0  # Track submission vs completion imbalance
             self.lock = threading.Lock()
             
-            # Adaptive parameters
-            self.min_submission_delay = 0.001  # 1ms minimum delay
-            self.max_submission_delay = 5.0    # 5s maximum delay
+            # Adaptive parameters optimized for target QPS
+            if target_qps <= 1.0:
+                # Very low QPS: smaller delays, higher sensitivity
+                self.min_submission_delay = 0.01   # 10ms minimum
+                self.max_submission_delay = 2.0    # 2s maximum
+                self.debt_reduction_rate = 0.8     # Faster debt reduction
+            elif target_qps <= 5.0:
+                # Low QPS: moderate delays
+                self.min_submission_delay = 0.005  # 5ms minimum
+                self.max_submission_delay = 3.0    # 3s maximum
+                self.debt_reduction_rate = 0.6     # Moderate debt reduction
+            else:
+                # Standard QPS: original parameters
+                self.min_submission_delay = 0.001  # 1ms minimum
+                self.max_submission_delay = 5.0    # 5s maximum
+                self.debt_reduction_rate = 0.5     # Standard debt reduction
             
         def get_current_target_qps(self) -> float:
             """Delegate to base controller."""
@@ -689,8 +718,8 @@ class RedisBenchmarker:
                 current_time = time.time()
                 self.completion_times.append(current_time)
                 
-                # Reduce submission debt when completions occur
-                self.submission_debt = max(0.0, self.submission_debt - 0.5)
+                # Reduce submission debt when completions occur (rate varies by QPS)
+                self.submission_debt = max(0.0, self.submission_debt - self.debt_reduction_rate)
                 
             # Delegate to base controller
             self.base_controller.record_completion()
@@ -702,7 +731,7 @@ class RedisBenchmarker:
             """
             with self.lock:
                 target_qps = self.get_current_target_qps()
-                if target_qps <= 0 or len(self.completion_times) < 5:
+                if target_qps <= 0 or len(self.completion_times) < self.min_completions_threshold:
                     return True  # Not enough data, allow submission
                     
                 # Calculate recent completion rate
@@ -764,6 +793,16 @@ class RedisBenchmarker:
             # Merge stats
             base_stats.update(adaptive_stats)
             return base_stats
+            
+        def get_base_target_qps(self) -> float:
+            """Get the base target QPS from the controller (used for initialization)."""
+            if hasattr(self.base_controller, 'get_current_target_qps'):
+                return self.base_controller.get_current_target_qps()
+            elif hasattr(self.base_controller, 'base_qps'):
+                return self.base_controller.base_qps
+            elif hasattr(self.base_controller, 'target_qps'):
+                return self.base_controller.target_qps
+            return 10.0  # Default assumption for parameter optimization
             
         def __getattr__(self, name):
             """Delegate unknown attributes to base controller."""
@@ -1021,10 +1060,14 @@ class RedisBenchmarker:
                 controller_description = f"QPS controller: {self.config.qps}"
                 
             # Wrap with adaptive completion rate limiting
-            qps_controller = self.AdaptiveQpsWrapper(base_controller)
+            qps_controller = self.AdaptiveQpsWrapper(
+                base_controller, 
+                tolerance_percent=self.config.qps_tolerance_percent
+            )
             
             if self.config.verbose:
-                self.console.print(f"[cyan]Using adaptive {controller_description} with completion rate limiting[/cyan]")
+                tolerance_msg = f"(±{self.config.qps_tolerance_percent:.1f}% tolerance)"
+                self.console.print(f"[cyan]Using adaptive {controller_description} with completion rate limiting {tolerance_msg}[/cyan]")
 
         # Custom progress bar with real-time metrics
         progress_columns = [
