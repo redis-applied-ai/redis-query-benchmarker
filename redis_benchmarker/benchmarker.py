@@ -621,6 +621,9 @@ class RedisBenchmarker:
                 batch_size = 1
                 batch_interval = 1.0 / current_target_qps
             
+            # Calculate current batch size (might be smaller for last batch)
+            current_batch_size = min(batch_size, remaining_requests)
+            
             # Check adaptive rate limiting before submission
             if not qps_controller.should_submit_batch(current_batch_size):
                 # Apply adaptive backpressure - skip this submission cycle
@@ -635,9 +638,6 @@ class RedisBenchmarker:
                 # Apply adaptive delay adjustment
                 adaptive_sleep_time = qps_controller.calculate_adaptive_delay(base_sleep_time)
                 time.sleep(adaptive_sleep_time)
-
-            # Calculate current batch size (might be smaller for last batch)
-            current_batch_size = min(batch_size, remaining_requests)
 
             # Submit the batch of queries and add to result queue immediately
             for _ in range(current_batch_size):
