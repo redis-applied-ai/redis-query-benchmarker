@@ -53,6 +53,7 @@ from .executors import list_query_executors
               type=click.Choice(['random', 'positive', 'negative', 'alternating']),
               help='Jitter direction for distributed coordination', show_default=True)
 @click.option('--epsilon', default=None, type=float, help='Epsilon value for query processing')
+@click.option('--qps-tolerance-percent', default=10.0, type=float, help='QPS tolerance percentage for adaptive rate limiting', show_default=True)
 def main(**kwargs):
     """Redis Query Benchmarker - Benchmark Redis search queries with configurable executors."""
 
@@ -106,6 +107,7 @@ def main(**kwargs):
                 jitter_distribution=kwargs['jitter_distribution'],
                 jitter_direction=kwargs['jitter_direction'],
                 epsilon=kwargs['epsilon'],
+                qps_tolerance_percent=kwargs['qps_tolerance_percent'],
                 extra_params=extra_params
             )
 
