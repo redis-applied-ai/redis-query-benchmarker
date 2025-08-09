@@ -2,6 +2,7 @@
 
 import random
 import string
+import sys
 import time
 from typing import List, Dict, Any, Optional
 import click
@@ -198,7 +199,8 @@ class RedisDataGenerator:
 
     def generate_and_insert_worker_chunk(self, document_type: str, start_idx: int,
                                         end_idx: int, vector_dim: int, key_prefix: str,
-                                        batch_size: int, pbar: tqdm) -> int:
+                                        batch_size: int, pbar: tqdm, is_interactive: bool = True,
+                                        total_count: int = 0) -> int:
         """Generate and insert a chunk of documents assigned to a worker thread."""
         generator_map = {
             "product": self.generate_product_document,
@@ -231,6 +233,14 @@ class RedisDataGenerator:
             with self._progress_lock:
                 pbar.update(len(batch_documents))
 
+                # For non-interactive terminals, print periodic status updates
+                if not is_interactive and total_count > 0:
+                    # Print status every ~10% or every 1000 documents, whichever is more frequent
+                    update_frequency = max(1, min(total_count // 10, 1000))
+                    if (pbar.n % update_frequency) == 0 or pbar.n == total_count:
+                        percentage = (pbar.n / total_count) * 100
+                        print(f"Document generation progress: {pbar.n}/{total_count} ({percentage:.1f}%)", flush=True)
+
             # Clear the batch from memory
             batch_documents.clear()
 
@@ -243,11 +253,19 @@ class RedisDataGenerator:
 
         total_inserted = 0
 
-        with tqdm(total=count, desc="Generating and inserting documents") as pbar:
+        # Check if terminal is interactive for progress bar display
+        is_interactive = sys.stdout.isatty()
+        tqdm_kwargs = {"total": count, "desc": "Generating and inserting documents"}
+        if not is_interactive:
+            tqdm_kwargs["disable"] = True
+            print("Starting document generation progress tracking...", flush=True)
+
+        with tqdm(**tqdm_kwargs) as pbar:
             if num_workers == 1:
                 # Single-threaded execution
                 total_inserted = self.generate_and_insert_worker_chunk(
-                    document_type, 0, count, vector_dim, key_prefix, batch_size, pbar
+                    document_type, 0, count, vector_dim, key_prefix, batch_size, pbar,
+                    is_interactive, count
                 )
             else:
                 # Multi-threaded execution
@@ -264,7 +282,7 @@ class RedisDataGenerator:
                             future = executor.submit(
                                 self.generate_and_insert_worker_chunk,
                                 document_type, start_idx, end_idx, vector_dim,
-                                key_prefix, batch_size, pbar
+                                key_prefix, batch_size, pbar, is_interactive, count
                             )
                             futures.append(future)
 
